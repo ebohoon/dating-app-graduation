@@ -1,0 +1,10 @@
+streamlit
+pandas
+python-dotenv
+openai
+pydantic
+langchain
+langchain-openai
+langchain-community
+faiss-cpu
+plotly
