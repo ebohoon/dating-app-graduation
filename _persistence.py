@@ -2,13 +2,10 @@
 세션·저장 동작 요약
 ------------------
 - **브라우저 탭이 열려 있는 동안**: Streamlit이 `st.session_state`에 상태를 유지합니다.
-  (일반 웹의 "쿠키"가 아니라, 서버·세션 연결 단위 저장입니다.)
-- **새로고침(F5) / 브라우저 재실행 후**: 세션이 비워질 수 있어, 같은 PC에서는
-  `data/app_session_state.json`에 주기적으로 백업합니다.
-- **자동 저장 시점**: 각 페이지 맨 아래 `render_trust_footer()`가 스크립트 한 번
-  실행이 끝날 때 `save_session_to_disk()`를 호출합니다.
-- **자동 복원 시점**: `render_page_shell()` 시작 시 `restore_session_from_disk()`
-  한 번(중복 복원 방지 플래그 사용).
+- **새로고침(F5)**: 새 세션이 시작되며, 아래 플래그가 꺼져 있으면 **디스크에서 복원하지 않아**
+  입력·프로필·매칭 등이 초기화된 것처럼 시작합니다.
+- **디스크 지속화**: `ENABLE_SESSION_DISK_PERSIST` 가 True일 때
+  `data/app_session_state.json` 에 저장·복원합니다. (기본값 True — 단계 이동·새로고침 후에도 입력 유지)
 """
 from __future__ import annotations
 
@@ -37,12 +34,17 @@ from _match_context import (
 )
 from _paths import data_path
 
+# False로 두면 브라우저 새로고침 시 세션이 비워집니다.
+ENABLE_SESSION_DISK_PERSIST: bool = True
+
 MESSAGES_COACH_KEY = "messages_coach"
 INIT_SIG_SUFFIX = "_init_sig"
 
 SESSION_FILE = data_path("app_session_state.json")
 
 PERSIST_KEYS: tuple[str, ...] = (
+    "_session_from_home",
+    STEP1_FORM_PROFILE_SIG_KEY,
     USER_AI_PROFILE_KEY,
     USER_KEYWORDS_SEED_KEY,
     USER_SELF_INTRO_KEY,
@@ -75,6 +77,12 @@ PERSIST_KEYS: tuple[str, ...] = (
     "_danger_report_reference_vision",
     "coach_external_paste",
     "coach_vision_transcript",
+    "coach_scenario_context_practice",
+    "coach_scenario_context_reference",
+    "coach_conversation_domain_practice",
+    "coach_conversation_domain_reference",
+    "coach_domain_other_hint_practice",
+    "coach_domain_other_hint_reference",
 )
 
 
@@ -122,8 +130,12 @@ def restore_session_from_disk() -> None:
     if st.session_state.get(_hydrated_key()):
         return
 
+    st.session_state[_hydrated_key()] = True
+
+    if not ENABLE_SESSION_DISK_PERSIST:
+        return
+
     if not SESSION_FILE.exists():
-        st.session_state[_hydrated_key()] = True
         return
 
     try:
@@ -140,11 +152,12 @@ def restore_session_from_disk() -> None:
             st.session_state[k] = out
     except (OSError, json.JSONDecodeError, ValueError, TypeError):
         pass
-    finally:
-        st.session_state[_hydrated_key()] = True
 
 
 def save_session_to_disk() -> bool:
+    if not ENABLE_SESSION_DISK_PERSIST:
+        return False
+
     payload: dict[str, Any] = {}
     for k in PERSIST_KEYS:
         if k not in st.session_state:

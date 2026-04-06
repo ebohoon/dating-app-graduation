@@ -8,7 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplat
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-from _match_context import MATCHED_PROFILE_KEY, USER_AI_PROFILE_KEY
+from _match_context import MATCHED_PROFILE_KEY, USER_AI_PROFILE_KEY, journey_can_access
 from _ui import (
     JOURNEY_GREETING,
     openai_key_configured,
@@ -62,7 +62,7 @@ def _my_profile_narrative(me: dict) -> str:
     kw = me.get("keywords") or []
     kw_str = ", ".join(kw) if isinstance(kw, list) else str(kw)
     chunks = [
-        f"닉네임: {me.get('display_name', '')}",
+        f"이름: {me.get('display_name', '')}",
         f"나이/성별: {me.get('age', '')}세, {me.get('gender', '')}",
         f"지역/직업: {me.get('location', '')} / {me.get('job', '')}",
         f"자기소개: {me.get('bio', '')}",
@@ -119,6 +119,17 @@ def generate_opening_to_partner(my_profile: dict, partner: dict) -> list[str]:
 
 st.set_page_config(page_title="통합 데이팅 AI", layout="wide", page_icon="💌")
 render_page_shell(journey_step=JOURNEY_GREETING)
+
+_ok3, _msg3 = journey_can_access("greeting")
+if not _ok3:
+    st.error(_msg3)
+    c_a, c_b = st.columns(2)
+    with c_a:
+        st.page_link("pages/01_AI_프로필_생성.py", label="① AI 프로필", use_container_width=True)
+    with c_b:
+        st.page_link("pages/02_프로필_매칭_검색.py", label="② 매칭·상대 선택", use_container_width=True)
+    render_trust_footer()
+    st.stop()
 
 render_page_header(
     kicker="Step ③ · 인사말",

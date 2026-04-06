@@ -6,6 +6,8 @@ Step ② 프로필 매칭 검색
   C. 프로필 궁합 레이더 차트
   F. 좋아요 / 관심없음 버튼
 """
+from __future__ import annotations
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -17,7 +19,10 @@ from _match_context import (
     MATCH_FILTER_META_KEY,
     MATCH_RESULTS_DF_KEY,
     USER_AI_PROFILE_KEY,
+    USER_KEYWORDS_SEED_KEY,
     USER_MATCH_KEYWORDS_KEY,
+    journey_can_access,
+    opposite_gender_for_match,
 )
 from _paths import data_path
 from _rag_profile import (
@@ -30,11 +35,26 @@ from _ui import render_match_page_styles, render_page_header, render_trust_foote
 st.set_page_config(page_title="통합 데이팅 AI", layout="wide", page_icon="💕")
 render_match_page_styles()
 
+_gate_ok, _gate_msg = journey_can_access("match")
+if not _gate_ok:
+    st.error(_gate_msg)
+    st.page_link("pages/01_AI_프로필_생성.py", label="① AI 프로필로 이동", use_container_width=True)
+    render_trust_footer()
+    st.stop()
+
+_me_for_gender = st.session_state.get(USER_AI_PROFILE_KEY)
+_opposite_gender = (
+    opposite_gender_for_match(str(_me_for_gender.get("gender", "")))
+    if isinstance(_me_for_gender, dict)
+    else None
+)
+_gender_preference = _opposite_gender if _opposite_gender else "모두"
+
 render_page_header(
     kicker="Step ② · 매칭",
     title="맞는 상대 찾기",
-    subtitle="관심 키워드의 **의미**까지 분석합니다. '커피'로 검색하면 '카페'를 키워드로 가진 상대도 찾아줍니다. "
-    "나이·성별로 범위를 줄인 뒤 카드에서 **인사말** 또는 **대화 연습**으로 연결하세요.",
+    subtitle="관심 키워드는 **① 프로필과 동일**하게 쓰입니다. **의미** 기반 매칭과 함께 나이·직업·소개글 등으로 좁힐 수 있습니다. "
+    "①에서 고른 **내 성별** 기준으로 **이성** 후보만 검색합니다.",
 )
 
 _me_card = st.session_state.get(USER_AI_PROFILE_KEY)
@@ -46,15 +66,20 @@ if isinstance(_me_card, dict) and _me_card.get("display_name"):
         )
         st.caption("관심: " + ", ".join(_me_card.get("keywords") or []))
 
-if "interest_draft" not in st.session_state:
-    st.session_state["interest_draft"] = ""
-_me = st.session_state.get(USER_AI_PROFILE_KEY)
-if isinstance(_me, dict) and _me.get("keywords") and not (st.session_state.get("interest_draft") or "").strip():
-    st.session_state["interest_draft"] = ", ".join(_me["keywords"])
-else:
-    kw_legacy = st.session_state.get(USER_MATCH_KEYWORDS_KEY)
-    if kw_legacy and isinstance(kw_legacy, list) and not (st.session_state.get("interest_draft") or "").strip():
-        st.session_state["interest_draft"] = ", ".join(kw_legacy)
+def _match_interests_from_step1() -> list[str]:
+    """① AI 프로필 키워드 → (없으면) 구버전 키워드 → (없으면) ① 시드 문자열."""
+    me = st.session_state.get(USER_AI_PROFILE_KEY)
+    if isinstance(me, dict):
+        kw = me.get("keywords") or []
+        if isinstance(kw, list) and kw:
+            return [str(x).strip() for x in kw if str(x).strip()]
+    leg = st.session_state.get(USER_MATCH_KEYWORDS_KEY)
+    if isinstance(leg, list) and leg:
+        return [str(x).strip() for x in leg if str(x).strip()]
+    seed = (st.session_state.get(USER_KEYWORDS_SEED_KEY) or "").strip()
+    if seed:
+        return [x.strip() for x in seed.replace("，", ",").split(",") if x.strip()]
+    return []
 
 
 @st.cache_data
@@ -64,6 +89,11 @@ def load_profiles() -> pd.DataFrame:
 
 
 profiles = load_profiles()
+
+if "liked_profiles" not in st.session_state:
+    st.session_state["liked_profiles"] = set()
+if "disliked_profiles" not in st.session_state:
+    st.session_state["disliked_profiles"] = set()
 
 if st.button("검색 결과 지우기", help="목록만 초기화합니다"):
     for k in (MATCH_RESULTS_DF_KEY, MATCH_FILTER_META_KEY,
@@ -78,32 +108,75 @@ if profile_embedding_available():
         icon="✨",
     )
 
-st.markdown('<p class="ux-section-lead">관심 키워드를 입력하세요. 쉼표로 여러 개 입력할 수 있습니다.</p>', unsafe_allow_html=True)
-st.markdown('<p class="ux-section-title">빠른 태그</p>', unsafe_allow_html=True)
-st.caption("누르면 입력란에 이어 붙습니다.")
-qc = st.columns(8)
-quick_tags = ["여행", "커피", "독서", "영화", "요리", "음악", "운동", "코딩"]
-for i, tag in enumerate(quick_tags):
-    with qc[i]:
-        if st.button(tag, key=f"quick_{tag}", use_container_width=True):
-            cur = st.session_state.get("interest_draft", "").strip()
-            parts = [x.strip() for x in cur.split(",") if x.strip()]
-            if tag not in parts:
-                parts.append(tag)
-            st.session_state["interest_draft"] = ", ".join(parts)
-            st.rerun()
-
-st.text_input(
-    "관심사 입력",
-    key="interest_draft",
-    placeholder="예: 커피, 여행, 산책 (쉼표로 구분)",
-    help="키워드의 의미를 분석하여 비슷한 단어도 매칭됩니다.",
-)
+_match_kw = _match_interests_from_step1()
+st.markdown('<p class="ux-section-title">매칭에 쓰는 관심 키워드</p>', unsafe_allow_html=True)
+if _match_kw:
+    st.info("① 프로필과 **동일한** 키워드로 관심사 매칭합니다: **" + "**, **".join(_match_kw) + "**")
+else:
+    st.warning(
+        "①에서 **관심 키워드**를 넣고 **프로필 반영**을 해 주세요. "
+        "(키워드가 없으면 매칭 점수를 계산할 수 없습니다.)"
+    )
 
 with st.form("search_form"):
     st.markdown("##### 검색 조건")
-    age_range = st.slider("선호하는 나이대", 20, 50, (20, 30))
-    gender_preference = st.radio("성별", ("모두", "남자", "여자"), horizontal=True)
+    age_range = st.slider("선호하는 상대 나이대", 20, 50, (20, 30))
+    if _opposite_gender:
+        st.caption(f"상대 성별: **{_opposite_gender}** 만 표시 (① 프로필의 내 성별 기준 이성)")
+    else:
+        st.warning("① 프로필에 성별(남/여)이 없어 전체 성별로 검색합니다. 프로필을 다시 만들어 주세요.")
+
+    st.markdown("###### 상대 프로필 텍스트 조건 (선택)")
+    job_needle = st.text_input(
+        "직업에 포함",
+        placeholder="예: 디자인, 개발, 의사 (비우면 조건 없음)",
+        help="상대 `직업` 필드에 이 문자열이 **포함**된 사람만 남깁니다.",
+    )
+    bio_needle = st.text_input(
+        "자기소개에 포함",
+        placeholder="예: 여행, 운동, 책 (비우면 조건 없음)",
+        help="상대 소개글에 이 문자열이 **포함**된 사람만 남깁니다.",
+    )
+
+    _nk = len(_match_kw)
+    _max_min = max(_nk, 1)
+    min_exact = st.slider(
+        "최소 정확 키워드 일치 개수",
+        min_value=0,
+        max_value=_max_min,
+        value=0 if _nk == 0 else 1,
+        help="0 = 제한 없음. ①에서 넣은 관심 키워드가 상대 태그와 **글자 그대로** 겹치는 개수 하한입니다.",
+    )
+
+    semantic_floor = st.slider(
+        "의미 매칭 포함 기준 (하이브리드)",
+        min_value=0.15,
+        max_value=0.55,
+        value=0.35,
+        step=0.05,
+        help="낮출수록 의미만 비슷해도 후보에 더 많이 남습니다. (임베딩이 꺼져 있으면 효과 없음)",
+    )
+
+    sort_mode = st.radio(
+        "정렬",
+        options=["match", "age_near"],
+        format_func=lambda x: "매칭 점수 높은 순" if x == "match" else "내 나이와 가까운 순",
+        horizontal=True,
+    )
+
+    max_show = st.selectbox(
+        "한 번에 보여 줄 최대 인원",
+        options=[10, 20, 30, 50, 0],
+        format_func=lambda n: "전체" if n == 0 else f"{n}명까지",
+        index=1,
+    )
+
+    hide_passed = st.checkbox(
+        "👎 패스한 사람은 결과에서 제외",
+        value=False,
+        help="이번 세션에서 관심없음을 누른 상대는 목록에 나오지 않습니다.",
+    )
+
     submitted = st.form_submit_button("검색하기", type="primary", use_container_width=True)
 
 
@@ -111,11 +184,30 @@ with st.form("search_form"):
 # 매칭 알고리즘
 # ════════════════════════════════════════════════════
 
+def _apply_profile_text_filters(
+    df: pd.DataFrame,
+    job_needle: str,
+    bio_needle: str,
+) -> pd.DataFrame:
+    out = df.copy()
+    j = (job_needle or "").strip()
+    b = (bio_needle or "").strip()
+    if j:
+        out = out[out["job"].astype(str).str.contains(j, case=False, na=False, regex=False)]
+    if b:
+        out = out[out["bio"].astype(str).str.contains(b, case=False, na=False, regex=False)]
+    return out
+
+
 def filter_profiles_keyword_only(
     profiles_df: pd.DataFrame,
     interests_list: list[str],
     age_range_tuple: tuple[int, int],
     gender_pref: str,
+    *,
+    job_needle: str = "",
+    bio_needle: str = "",
+    min_exact_matches: int = 0,
 ) -> pd.DataFrame:
     """[B] 기존 키워드 정확 매칭 전용 (비교용)."""
     filtered = profiles_df[
@@ -123,6 +215,7 @@ def filter_profiles_keyword_only(
     ].copy()
     if gender_pref != "모두":
         filtered = filtered[filtered["gender"] == gender_pref].copy()
+    filtered = _apply_profile_text_filters(filtered, job_needle, bio_needle)
     if not interests_list:
         return filtered.iloc[0:0]
 
@@ -134,7 +227,10 @@ def filter_profiles_keyword_only(
     filtered["emb_score"] = 0.0
     filtered["match_score"] = filtered["keyword_score"]
     filtered["use_embedding"] = False
-    return filtered[filtered["match_count"] > 0].sort_values("match_count", ascending=False)
+    result = filtered[filtered["match_count"] > 0].copy()
+    if min_exact_matches > 0:
+        result = result[result["match_count"] >= min_exact_matches]
+    return result.sort_values("match_count", ascending=False)
 
 
 def filter_profiles_hybrid(
@@ -142,6 +238,11 @@ def filter_profiles_hybrid(
     interests_list: list[str],
     age_range_tuple: tuple[int, int],
     gender_pref: str,
+    *,
+    job_needle: str = "",
+    bio_needle: str = "",
+    hybrid_threshold: float = 0.35,
+    min_exact_matches: int = 0,
 ) -> pd.DataFrame:
     """하이브리드: 키워드 50% + 임베딩 50%."""
     filtered = profiles_df[
@@ -149,6 +250,7 @@ def filter_profiles_hybrid(
     ].copy()
     if gender_pref != "모두":
         filtered = filtered[filtered["gender"] == gender_pref].copy()
+    filtered = _apply_profile_text_filters(filtered, job_needle, bio_needle)
     if not interests_list:
         return filtered.iloc[0:0]
 
@@ -170,15 +272,53 @@ def filter_profiles_hybrid(
     if use_embedding:
         filtered["emb_score"] = filtered["name"].map(emb_scores).fillna(0.0).clip(0.0, 1.0)
         filtered["match_score"] = 0.5 * filtered["keyword_score"] + 0.5 * filtered["emb_score"]
-        THRESHOLD = 0.35
+        threshold = float(hybrid_threshold)
     else:
         filtered["emb_score"] = 0.0
         filtered["match_score"] = filtered["keyword_score"]
-        THRESHOLD = 0.0
+        threshold = 0.0
 
-    result = filtered[filtered["match_score"] >= THRESHOLD].copy()
+    result = filtered[filtered["match_score"] >= threshold].copy()
+    if min_exact_matches > 0:
+        result = result[result["match_count"] >= min_exact_matches]
     result["use_embedding"] = use_embedding
     return result.sort_values("match_score", ascending=False)
+
+
+def _sort_match_results(
+    df: pd.DataFrame | None,
+    mode: str,
+    user_age: int | None,
+) -> pd.DataFrame | None:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if mode == "age_near" and user_age is not None:
+        try:
+            ua = int(user_age)
+            out["_age_dist"] = (out["age"].astype(int) - ua).abs()
+            out = out.sort_values(["_age_dist", "match_score"], ascending=[True, False]).drop(
+                columns=["_age_dist"]
+            )
+        except (TypeError, ValueError, KeyError):
+            out = out.sort_values("match_score", ascending=False)
+    else:
+        out = out.sort_values("match_score", ascending=False)
+    return out
+
+
+def _drop_disliked_names(df: pd.DataFrame | None, disliked: set[str]) -> pd.DataFrame | None:
+    if df is None or df.empty or not disliked:
+        return df
+    return df[~df["name"].astype(str).isin(disliked)].copy()
+
+
+def _limit_rows(df: pd.DataFrame | None, max_rows: int) -> pd.DataFrame | None:
+    if df is None or df.empty or max_rows <= 0:
+        return df
+    if len(df) <= max_rows:
+        return df
+    return df.head(max_rows).copy()
 
 
 # ════════════════════════════════════════════════════
@@ -298,19 +438,62 @@ def render_radar_chart(scores: dict[str, int], name: str):
 # ════════════════════════════════════════════════════
 
 if submitted:
-    interests_text = (st.session_state.get("interest_draft") or "").strip()
-    interests = [i.strip() for i in interests_text.split(",") if i.strip()]
+    interests = _match_interests_from_step1()
+    _me_state = st.session_state.get(USER_AI_PROFILE_KEY)
+    user_age_for_sort: int | None = None
+    if isinstance(_me_state, dict) and _me_state.get("age") is not None:
+        try:
+            user_age_for_sort = int(_me_state["age"])
+        except (TypeError, ValueError):
+            user_age_for_sort = None
+
+    _raw_dis = st.session_state.get("disliked_profiles")
+    disliked_for_filter: set[str] = set(_raw_dis) if _raw_dis else set()
 
     with st.spinner("의미 분석 중… 잠깐만요 🔍"):
-        result_hybrid = filter_profiles_hybrid(profiles, interests, age_range, gender_preference)
-        result_kw_only = filter_profiles_keyword_only(profiles, interests, age_range, gender_preference)
+        result_hybrid = filter_profiles_hybrid(
+            profiles,
+            interests,
+            age_range,
+            _gender_preference,
+            job_needle=(job_needle or "").strip(),
+            bio_needle=(bio_needle or "").strip(),
+            hybrid_threshold=float(semantic_floor),
+            min_exact_matches=int(min_exact),
+        )
+        result_kw_only = filter_profiles_keyword_only(
+            profiles,
+            interests,
+            age_range,
+            _gender_preference,
+            job_needle=(job_needle or "").strip(),
+            bio_needle=(bio_needle or "").strip(),
+            min_exact_matches=int(min_exact),
+        )
+
+    if hide_passed:
+        result_hybrid = _drop_disliked_names(result_hybrid, disliked_for_filter)
+        result_kw_only = _drop_disliked_names(result_kw_only, disliked_for_filter)
+
+    result_hybrid = _sort_match_results(result_hybrid, sort_mode, user_age_for_sort)
+    result_kw_only = _sort_match_results(result_kw_only, sort_mode, user_age_for_sort)
+
+    result_hybrid = _limit_rows(result_hybrid, int(max_show))
+    result_kw_only = _limit_rows(result_kw_only, int(max_show))
 
     st.session_state[MATCH_RESULTS_DF_KEY] = result_hybrid
     st.session_state["_kw_only_results"] = result_kw_only
     st.session_state[MATCH_FILTER_META_KEY] = {
         "interests": interests,
         "age_range": age_range,
-        "gender_preference": gender_preference,
+        "gender_preference": _gender_preference,
+        "job_needle": (job_needle or "").strip(),
+        "bio_needle": (bio_needle or "").strip(),
+        "min_exact_matches": int(min_exact),
+        "semantic_floor": float(semantic_floor),
+        "sort_mode": sort_mode,
+        "max_show": int(max_show),
+        "hide_passed": bool(hide_passed),
     }
 
 
@@ -342,19 +525,45 @@ meta = st.session_state.get(MATCH_FILTER_META_KEY, {})
 intr: list[str] = meta.get("interests", [])
 ar = meta.get("age_range", (20, 30))
 gp = meta.get("gender_preference", "모두")
+_meta_job = (meta.get("job_needle") or "").strip()
+_meta_bio = (meta.get("bio_needle") or "").strip()
+_meta_min_ex = int(meta.get("min_exact_matches") or 0)
+_meta_sem = float(meta.get("semantic_floor") or 0.35)
+_meta_sort = meta.get("sort_mode") or "match"
+_meta_max = int(meta.get("max_show") or 0)
+_meta_hide = bool(meta.get("hide_passed"))
 
-# [F] 좋아요 / 관심없음 세션 초기화
-if "liked_profiles" not in st.session_state:
-    st.session_state["liked_profiles"] = set()
-if "disliked_profiles" not in st.session_state:
-    st.session_state["disliked_profiles"] = set()
+def _match_conditions_caption() -> str:
+    parts = [
+        f"관심 키워드 **{', '.join(intr) if intr else '(없음)'}**",
+        f"나이 **{ar[0]}–{ar[1]}**",
+        f"성별 **{gp}**",
+    ]
+    if _meta_job:
+        parts.append(f"직업 포함「{_meta_job}」")
+    if _meta_bio:
+        parts.append(f"소개 포함「{_meta_bio}」")
+    if _meta_min_ex > 0:
+        parts.append(f"정확 일치 ≥{_meta_min_ex}개")
+    if _meta_sem != 0.35:
+        parts.append(f"의미 기준 {_meta_sem:.2f}")
+    if _meta_sort == "age_near":
+        parts.append("정렬: 나이 가까운 순")
+    if _meta_max > 0:
+        parts.append(f"상한 {_meta_max}명")
+    if _meta_hide:
+        parts.append("패스 제외")
+    return " · ".join(parts)
 
 liked_set: set[str] = st.session_state["liked_profiles"]
 disliked_set: set[str] = st.session_state["disliked_profiles"]
 
 if result_hybrid is not None:
     if result_hybrid.empty and (result_kw_only is None or result_kw_only.empty):
-        st.warning("조건에 맞는 프로필이 없어요. 관심사·나이 범위를 바꿔 다시 검색해 보세요.")
+        st.warning(
+            "조건에 맞는 프로필이 없어요. ① 키워드·**프로필 반영**을 확인하거나, "
+            "나이·직업·소개글·최소 일치 개수·의미 기준을 완화해 다시 검색해 보세요."
+        )
     else:
         use_emb = (
             bool(result_hybrid.get("use_embedding", pd.Series([False])).iloc[0])
@@ -481,21 +690,24 @@ if result_hybrid is not None:
                         with radar_cols[i]:
                             st.metric(dim, f"{val}점")
 
-            # 버튼 행 — tab_prefix 로 탭별 key 충돌 방지
+            # 버튼 행 — 순서: ③ 인사말 → ④ 대화는 ③ 이후. 열 3개·좁은 gap 으로 한 덩어리처럼 배치
             btn_key = f"{tab_prefix}_{name_str}_{row['age']}"
-            bc1, bc2, bc3, bc4 = st.columns([2, 2, 1, 1])
+            try:
+                bc1, bc2, bc3 = st.columns([2.4, 1, 1], gap="small")
+            except TypeError:
+                bc1, bc2, bc3 = st.columns([2.4, 1, 1])
             with bc1:
-                if st.button("💌 인사말 만들기", key=f"greet_{btn_key}"):
+                if st.button(
+                    "💌 인사말 만들기",
+                    key=f"greet_{btn_key}",
+                    type="primary",
+                    use_container_width=True,
+                ):
                     st.session_state[MATCHED_PROFILE_KEY] = profile_dict_from_row(row)
                     st.switch_page("pages/03_인사말_생성.py")
             with bc2:
-                if st.button("💬 바로 대화 연습", key=f"chat_{btn_key}", type="primary"):
-                    st.session_state[MATCHED_PROFILE_KEY] = profile_dict_from_row(row)
-                    st.switch_page("pages/04_대화_도우미.py")
-            with bc3:
-                # [F] 좋아요
                 like_label = "❤️ 취소" if name_str in liked_set else "👍 관심"
-                if st.button(like_label, key=f"like_{btn_key}"):
+                if st.button(like_label, key=f"like_{btn_key}", use_container_width=True):
                     if name_str in liked_set:
                         liked_set.discard(name_str)
                     else:
@@ -503,10 +715,9 @@ if result_hybrid is not None:
                         disliked_set.discard(name_str)
                     st.session_state["liked_profiles"] = liked_set
                     st.rerun()
-            with bc4:
-                # [F] 관심없음
+            with bc3:
                 dis_label = "🚫 취소" if name_str in disliked_set else "👎 패스"
-                if st.button(dis_label, key=f"dis_{btn_key}"):
+                if st.button(dis_label, key=f"dis_{btn_key}", use_container_width=True):
                     if name_str in disliked_set:
                         disliked_set.discard(name_str)
                     else:
@@ -521,9 +732,7 @@ if result_hybrid is not None:
                 st.warning("하이브리드 매칭 결과가 없습니다.")
             else:
                 mode_label = "의미 유사도 + 키워드 혼합 순" if use_emb else "키워드 매칭 순"
-                st.success(
-                    f"조건: 관심사 **{', '.join(intr)}** · 나이 **{ar[0]}–{ar[1]}** · 성별 **{gp}** ({mode_label})"
-                )
+                st.success(f"조건: {_match_conditions_caption()} — {mode_label}")
                 for _, row in result_hybrid.iterrows():
                     with st.container(border=True):
                         render_card(row, show_enhanced=True, tab_prefix="hyb")
@@ -533,9 +742,7 @@ if result_hybrid is not None:
             if result_kw_only is None or result_kw_only.empty:
                 st.warning("키워드 정확 매칭 결과가 없습니다. 키워드를 다시 확인하세요.")
             else:
-                st.success(
-                    f"조건: 관심사 **{', '.join(intr)}** · 나이 **{ar[0]}–{ar[1]}** · 성별 **{gp}** (키워드 일치만)"
-                )
+                st.success(f"조건: {_match_conditions_caption()} — 키워드 일치만")
                 for _, row in result_kw_only.iterrows():
                     with st.container(border=True):
                         render_card(row, show_enhanced=False, tab_prefix="kw")

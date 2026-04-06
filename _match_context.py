@@ -3,7 +3,10 @@
 """
 from __future__ import annotations
 
+import json
 from typing import Any
+
+import streamlit as st
 
 MATCHED_PROFILE_KEY = "matched_profile"
 """사용자가 매칭으로 고른 상대 프로필."""
@@ -37,6 +40,9 @@ USER_MATCH_KEYWORDS_KEY = "user_match_keywords"
 
 USER_NAME = "철수"
 
+STEP1_FORM_PROFILE_SIG_KEY = "_step1_form_profile_sig"
+"""① 편집 폼이 USER_AI_PROFILE_KEY 와 맞춰졌는지 추적(단계 이동 후 복원용)."""
+
 
 def _profile_signature(match: dict[str, Any] | None) -> tuple[Any, ...]:
     if not match:
@@ -69,6 +75,60 @@ def _user_profile_signature(me: dict[str, Any] | None) -> tuple[Any, ...]:
         me.get("lifestyle_summary"),
         tkw,
     )
+
+
+def _step1_profile_sync_token(me: dict[str, Any]) -> str:
+    return json.dumps(_user_profile_signature(me), ensure_ascii=False, default=str)
+
+
+def apply_user_ai_profile_to_step1_form(me: dict[str, Any]) -> None:
+    """저장된 AI 프로필 dict → ① 페이지 입력 위젯 세션 키에 반영."""
+    if not isinstance(me, dict):
+        return
+    st.session_state[PF_INPUT_DISPLAY_NAME] = str(me.get("display_name") or "")
+    try:
+        st.session_state[PF_INPUT_AGE] = int(me.get("age") or 28)
+    except (TypeError, ValueError):
+        st.session_state[PF_INPUT_AGE] = 28
+    g = str(me.get("gender") or "남자")
+    st.session_state[PF_INPUT_GENDER] = g if g in ("남자", "여자") else "남자"
+    st.session_state[PF_INPUT_LOCATION] = str(me.get("location") or "")
+    st.session_state[PF_INPUT_JOB] = str(me.get("job") or "")
+    kw = me.get("keywords") or []
+    if isinstance(kw, list):
+        st.session_state[USER_KEYWORDS_SEED_KEY] = ", ".join(
+            str(x).strip() for x in kw if str(x).strip()
+        )
+    else:
+        st.session_state[USER_KEYWORDS_SEED_KEY] = ""
+    st.session_state[PF_INPUT_BIO_DRAFT] = str(me.get("bio") or "")
+    st.session_state[PF_INPUT_DATING_GOAL] = str(me.get("dating_goal") or "")
+    st.session_state[PF_INPUT_IDEAL] = str(me.get("ideal_partner") or "")
+    st.session_state[PF_INPUT_LIFESTYLE] = str(me.get("lifestyle_summary") or "")
+
+
+def mark_step1_form_synced_with_profile(me: dict[str, Any]) -> None:
+    st.session_state[STEP1_FORM_PROFILE_SIG_KEY] = _step1_profile_sync_token(me)
+
+
+def maybe_restore_step1_form_from_saved_profile() -> None:
+    """
+    다른 단계를 다녀온 뒤 입력칸이 비었거나, 저장 프로필만 갱신된 경우
+    user_ai_profile 내용으로 ① 입력란을 맞춘다.
+    """
+    me = st.session_state.get(USER_AI_PROFILE_KEY)
+    if not isinstance(me, dict) or not str(me.get("display_name") or "").strip():
+        return
+    token = _step1_profile_sync_token(me)
+    prev = st.session_state.get(STEP1_FORM_PROFILE_SIG_KEY)
+    name_empty = not str(st.session_state.get(PF_INPUT_DISPLAY_NAME) or "").strip()
+    if name_empty:
+        apply_user_ai_profile_to_step1_form(me)
+        st.session_state[STEP1_FORM_PROFILE_SIG_KEY] = token
+        return
+    if prev is not None and token != prev:
+        apply_user_ai_profile_to_step1_form(me)
+    st.session_state[STEP1_FORM_PROFILE_SIG_KEY] = token
 
 
 def user_play_name(st: Any) -> str:
@@ -107,7 +167,7 @@ def _user_me_blurb(me: dict[str, Any]) -> str:
     if me.get("lifestyle_summary"):
         extra += f"- 라이프스타일: {me.get('lifestyle_summary')}\n"
     return (
-        f"- 이름(닉네임): {me.get('display_name', '')}\n"
+        f"- 이름: {me.get('display_name', '')}\n"
         f"- 나이: {me.get('age', '')}, 성별: {me.get('gender', '')}\n"
         f"- 지역: {me.get('location', '')}\n"
         f"- 직업: {me.get('job', '')}\n"
@@ -193,3 +253,70 @@ def ai_avatar_emoji(match: dict[str, Any] | None) -> str:
     if match.get("gender") == "남자":
         return "👨"
     return "👩🏼"
+
+
+def user_profile_step_done(me: Any) -> bool:
+    """① 완료: AI 프로필에 이름·성별(남/여)이 확정된 상태."""
+    if not isinstance(me, dict):
+        return False
+    if not str(me.get("display_name") or "").strip():
+        return False
+    return me.get("gender") in ("남자", "여자")
+
+
+def match_step_done() -> bool:
+    """② 완료: 매칭에서 상대 프로필을 하나 선택한 상태."""
+    m = st.session_state.get(MATCHED_PROFILE_KEY)
+    return isinstance(m, dict) and bool(str(m.get("name") or "").strip())
+
+
+def greeting_step_done() -> bool:
+    """③ 완료: 인사말 후보를 한 번 이상 생성한 상태."""
+    lines = st.session_state.get("_last_intro_lines")
+    return isinstance(lines, list) and len(lines) > 0
+
+
+def journey_can_access(target: str) -> tuple[bool, str]:
+    """
+    단계 잠금: profile / match / greeting / coach 순.
+    반환: (허용 여부, 차단 시 안내 문구).
+    """
+    me = st.session_state.get(USER_AI_PROFILE_KEY)
+    if target == "profile":
+        return True, ""
+
+    if not user_profile_step_done(me):
+        return (
+            False,
+            "① **AI 프로필**에서 프로필을 생성하고, 성별을 **남자** 또는 **여자**로 확정해 주세요.",
+        )
+
+    if target == "match":
+        return True, ""
+
+    if not match_step_done():
+        return False, "② **매칭**에서 검색 후 **상대 한 명을 선택**해 주세요."
+
+    if target == "greeting":
+        return True, ""
+
+    if not greeting_step_done():
+        return (
+            False,
+            "③ **인사말**에서 **첫 인사 후보 생성** 버튼으로 멘트를 한 번 만들어 주세요.",
+        )
+
+    if target == "coach":
+        return True, ""
+
+    return True, ""
+
+
+def opposite_gender_for_match(user_gender: str | None) -> str | None:
+    """① 프로필 성별 기준 ② 매칭에서 쓸 이성 필터 값 ('남자' | '여자')."""
+    g = (user_gender or "").strip()
+    if g == "남자":
+        return "여자"
+    if g == "여자":
+        return "남자"
+    return None

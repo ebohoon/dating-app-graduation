@@ -13,6 +13,9 @@ import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
 JOURNEY_HOME = "home"
+# 홈(app.py)을 거친 세션만 True. 새로고침 시 세션이 비워지면 하위 페이지에서 홈으로 보냄.
+SESSION_FROM_HOME_KEY = "_session_from_home"
+
 JOURNEY_PROFILE = "profile"
 JOURNEY_MATCH = "match"
 JOURNEY_GREETING = "greeting"
@@ -20,6 +23,14 @@ JOURNEY_COACH = "coach"
 JOURNEY_KEYWORDS = JOURNEY_PROFILE
 
 _JOURNEY_ORDER = [JOURNEY_HOME, JOURNEY_PROFILE, JOURNEY_MATCH, JOURNEY_GREETING, JOURNEY_COACH]
+
+# 사이드바·네비 단계 잠금용 (journey_can_access 인자)
+_JOURNEY_GATE_STEP: dict[str, str] = {
+    JOURNEY_PROFILE: "profile",
+    JOURNEY_MATCH: "match",
+    JOURNEY_GREETING: "greeting",
+    JOURNEY_COACH: "coach",
+}
 
 # 홈은 ‘단계’가 아니라 진입 화면 — 사이드바에는 ①~④만 노출해 인지 부하를 줄임
 _STEP_MARKERS = ["①", "②", "③", "④"]
@@ -196,6 +207,27 @@ def inject_app_styles() -> None:
     [data-testid="stSidebarNav"] { padding: 0.4rem 0.15rem 1rem !important; }
     [data-testid="stSidebarNav"] ul { padding-left: 0.2rem !important; margin: 0 !important; }
     [data-testid="stSidebarNav"] li { margin: 0.2rem 0 !important; }
+    .ux-sidebar-step-locked {
+        padding: 0.45rem 0.55rem;
+        border-radius: var(--radius-sm);
+        color: var(--muted);
+        font-size: 0.88rem;
+        font-weight: 500;
+        opacity: 0.72;
+    }
+    .ux-topnav-locked {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 2.35rem;
+        padding: 0.35rem 0.4rem;
+        border-radius: var(--radius-sm);
+        background: rgba(255,255,255,0.35);
+        color: var(--muted);
+        font-size: 0.82rem;
+        font-weight: 500;
+        opacity: 0.75;
+    }
     [data-testid="stSidebarNav"] a {
         display: flex !important;
         align-items: center !important;
@@ -809,23 +841,38 @@ def inject_app_styles() -> None:
 
 def render_top_nav() -> None:
     """글래스 패널 안 상단 빠른 이동."""
+    from _match_context import journey_can_access
+
     with st.container(border=True):
         st.markdown('<p class="ux-topnav-kicker">빠른 이동</p>', unsafe_allow_html=True)
         r1 = st.columns(5)
-        links = [
-            ("app.py", "홈", "키워드 입력 · 추천 순서 안내"),
-            ("pages/01_AI_프로필_생성.py", "① 프로필", "키워드 기반 AI 프로필"),
-            ("pages/02_프로필_매칭_검색.py", "② 매칭", "조건 검색 · 상대 선택"),
-            ("pages/03_인사말_생성.py", "③ 인사말", "첫 메시지 초안"),
-            ("pages/04_대화_도우미.py", "④ 대화", "멘트·RAG·코칭"),
+        links: list[tuple[str, str, str, str | None]] = [
+            ("app.py", "홈", "키워드 입력 · 추천 순서 안내", None),
+            ("pages/01_AI_프로필_생성.py", "① 프로필", "키워드 기반 AI 프로필", "profile"),
+            ("pages/02_프로필_매칭_검색.py", "② 매칭", "조건 검색 · 상대 선택", "match"),
+            ("pages/03_인사말_생성.py", "③ 인사말", "첫 메시지 초안", "greeting"),
+            ("pages/04_대화_도우미.py", "④ 대화", "한마디·예시 코칭·조언 비교", "coach"),
         ]
-        for col, (path, label, tip) in zip(r1, links):
+        for col, (path, label, tip, gate) in zip(r1, links):
             with col:
-                st.page_link(path, label=label, use_container_width=True, help=tip)
+                if gate is None:
+                    st.page_link(path, label=label, use_container_width=True, help=tip)
+                else:
+                    ok, _ = journey_can_access(gate)
+                    if ok:
+                        st.page_link(path, label=label, use_container_width=True, help=tip)
+                    else:
+                        st.markdown(
+                            f'<div class="ux-topnav-locked" title="이전 단계를 먼저 완료하세요">'
+                            f"{html_module.escape(label)} 🔒</div>",
+                            unsafe_allow_html=True,
+                        )
     st.markdown('<div class="ux-nav-rule" aria-hidden="true"></div>', unsafe_allow_html=True)
 
 
 def render_journey_sidebar(active: str) -> None:
+    from _match_context import journey_can_access
+
     try:
         idx_active = _JOURNEY_ORDER.index(active)
     except ValueError:
@@ -854,6 +901,8 @@ def render_journey_sidebar(active: str) -> None:
             is_active = key == active
             is_done = idx_active >= 0 and idx_active > order_idx
             label_txt = f"{'✓ ' if is_done and not is_active else ''}{sym} {label}"
+            gate_target = _JOURNEY_GATE_STEP.get(key, "profile")
+            step_ok, _ = journey_can_access(gate_target)
             if is_active:
                 st.markdown(
                     f'<div class="ux-sidebar-step-active">'
@@ -861,6 +910,12 @@ def render_journey_sidebar(active: str) -> None:
                     f"<span>{html_module.escape(label)} · 현재</span></div>",
                     unsafe_allow_html=True,
                 )
+            elif not step_ok:
+                st.markdown(
+                    f'<div class="ux-sidebar-step-locked">{html_module.escape(label_txt)} 🔒</div>',
+                    unsafe_allow_html=True,
+                )
+                st.caption("이전 단계 완료 후 이동")
             else:
                 st.page_link(
                     path,
@@ -900,6 +955,14 @@ def render_page_shell(*, journey_step: str | None = None) -> None:
         restore_session_from_disk()
     except Exception:
         pass
+
+    # 새로고침(F5) → 새 Streamlit 세션 → 표식 없음 → 홈으로 이동
+    if journey_step is not None and journey_step != JOURNEY_HOME:
+        if not st.session_state.get(SESSION_FROM_HOME_KEY):
+            st.switch_page("app.py")
+    if journey_step == JOURNEY_HOME:
+        st.session_state[SESSION_FROM_HOME_KEY] = True
+
     inject_app_styles()
     render_top_nav()
     if journey_step is not None:
@@ -963,47 +1026,23 @@ def render_home_flow_rail() -> None:
 
 
 def render_home_feature_grid() -> None:
-    """홈 본문 채움: 단계별 요약 카드 + 각 단계로 이동."""
+    """홈 본문 채움: 단계별 요약 카드(이동 버튼 없음 — 사이드바·상단 네비 사용)."""
     st.markdown(
         '<p class="ux-section-title ux-home-section-after-flow">단계별로 이렇게 써요</p>',
         unsafe_allow_html=True,
     )
     st.markdown(
-        '<p class="ux-home-lead-tight">위 <strong>빠른 이동</strong>이나 왼쪽 <strong>진행 단계</strong>와 같은 순서예요.</p>',
+        '<p class="ux-home-lead-tight">순서는 상단 <strong>빠른 이동</strong>·왼쪽 <strong>진행 단계</strong>와 같아요.</p>',
         unsafe_allow_html=True,
     )
     cols = st.columns(4, gap="medium")
-    items: list[tuple[str, str, str, str, str]] = [
-        (
-            "pages/01_AI_프로필_생성.py",
-            "🪪",
-            "① AI 프로필",
-            "키워드·톤에 맞는 소개 카드 문구를 만듭니다.",
-            "프로필 열기",
-        ),
-        (
-            "pages/02_프로필_매칭_검색.py",
-            "🔍",
-            "② 매칭",
-            "나이·관심사로 후보를 좁히고 한 명을 고릅니다.",
-            "매칭 열기",
-        ),
-        (
-            "pages/03_인사말_생성.py",
-            "💌",
-            "③ 인사말",
-            "선택한 상대에게 보낼 첫 멘트 초안을 뽑습니다.",
-            "인사말 열기",
-        ),
-        (
-            "pages/04_대화_도우미.py",
-            "💬",
-            "④ 대화 도우미",
-            "멘트 추천·유사 대화·코칭으로 대화를 연습합니다.",
-            "대화 열기",
-        ),
+    items: list[tuple[str, str, str]] = [
+        ("🪪", "① AI 프로필", "키워드·톤에 맞는 소개 카드 문구를 만듭니다."),
+        ("🔍", "② 매칭", "나이·관심사로 후보를 좁히고 한 명을 고릅니다."),
+        ("💌", "③ 인사말", "선택한 상대에게 보낼 첫 멘트 초안을 뽑습니다."),
+        ("💬", "④ 대화 도우미", "한마디 추천·예시 코칭·조언 비교·대화 점검으로 연습합니다."),
     ]
-    for col, (path, icon, title, desc, label) in zip(cols, items):
+    for col, (icon, title, desc) in zip(cols, items):
         with col:
             st.markdown(
                 f'<div class="ux-feature-card" role="article">'
@@ -1013,7 +1052,6 @@ def render_home_feature_grid() -> None:
                 f"</div>",
                 unsafe_allow_html=True,
             )
-            st.page_link(path, label=label, use_container_width=True, help=f"{title} 화면으로 이동")
 
 
 def render_home_start_cta() -> None:
@@ -1033,51 +1071,73 @@ def render_home_start_cta() -> None:
 
 
 def render_home_navigation() -> None:
+    from _match_context import journey_can_access
+
     st.markdown('<p class="ux-section-title">단계별 안내</p>', unsafe_allow_html=True)
     st.markdown(
         '<p class="ux-section-lead">사이드바 <strong>진행 단계 (①~④)</strong>와 같은 순서입니다. '
-        "①을 건너뛰려면 ②에서 바로 검색할 수 있어요.</p>",
+        "앞 단계를 완료해야 다음 화면으로 이동할 수 있습니다.</p>",
         unsafe_allow_html=True,
     )
-    steps = [
+    steps: list[tuple[str, str, str, str, str]] = [
         (
             "①",
             "AI 프로필",
             "pages/01_AI_프로필_생성.py",
+            "profile",
             "관심 키워드와 메모를 바탕으로 나만의 프로필 카드를 만듭니다.",
         ),
         (
             "②",
             "프로필 매칭",
             "pages/02_프로필_매칭_검색.py",
-            "나이·성별·관심사로 후보를 좁히고 한 명을 선택합니다.",
+            "match",
+            "① 성별 기준 **이성** 후보만 보이도록 검색합니다.",
         ),
         (
             "③",
             "인사말",
             "pages/03_인사말_생성.py",
+            "greeting",
             "선택한 상대에게 보낼 첫 인사 멘트 초안을 만듭니다.",
         ),
         (
             "④",
             "대화 도우미",
             "pages/04_대화_도우미.py",
-            "짧은 멘트, 유사 대화 참고, 투표형 조언으로 대화를 연습합니다.",
+            "coach",
+            "한마디 추천·예시 코칭·조언 비교·대화 점검으로 연습합니다.",
         ),
     ]
-    for badge, title, path, desc in steps:
+    for badge, title, path, gate, desc in steps:
         st.markdown(
             f'<div class="ux-step-card"><strong>{badge} {title}</strong> — {desc}</div>',
             unsafe_allow_html=True,
         )
-        st.page_link(path, label=f"{badge} 이동", use_container_width=True)
+        ok, _ = journey_can_access(gate)
+        if ok:
+            st.page_link(path, label=f"{badge} 이동", use_container_width=True)
+        else:
+            st.caption(f"{badge} 잠금 · 이전 단계를 먼저 완료하세요")
 
     st.markdown('<p class="ux-section-title">바로가기</p>', unsafe_allow_html=True)
-    st.markdown('<p class="ux-section-lead">자주 쓰는 화면으로 바로 점프합니다.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="ux-section-lead">자주 쓰는 화면으로 바로 점프합니다. (잠긴 단계는 사이드바에서 안내를 확인하세요.)</p>', unsafe_allow_html=True)
     g1, g2 = st.columns(2)
+    quick = [
+        ("pages/01_AI_프로필_생성.py", "① AI 프로필", "profile"),
+        ("pages/02_프로필_매칭_검색.py", "② 매칭 검색", "match"),
+        ("pages/03_인사말_생성.py", "③ 인사말", "greeting"),
+        ("pages/04_대화_도우미.py", "④ 대화 도우미", "coach"),
+    ]
     with g1:
-        st.page_link("pages/01_AI_프로필_생성.py", label="① AI 프로필", use_container_width=True)
-        st.page_link("pages/02_프로필_매칭_검색.py", label="② 매칭 검색", use_container_width=True)
+        for path, label, gate in quick[:2]:
+            if journey_can_access(gate)[0]:
+                st.page_link(path, label=label, use_container_width=True)
+            else:
+                st.caption(f"{label} 🔒")
     with g2:
-        st.page_link("pages/03_인사말_생성.py", label="③ 인사말", use_container_width=True)
-        st.page_link("pages/04_대화_도우미.py", label="④ 대화 도우미", use_container_width=True)
+        for path, label, gate in quick[2:]:
+            if journey_can_access(gate)[0]:
+                st.page_link(path, label=label, use_container_width=True)
+            else:
+                st.caption(f"{label} 🔒")

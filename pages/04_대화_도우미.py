@@ -18,13 +18,22 @@ from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplat
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from _match_context import MATCHED_PROFILE_KEY, ensure_chat_session, partner_context_for_llm
+from _match_context import (
+    MATCHED_PROFILE_KEY,
+    USER_AI_PROFILE_KEY,
+    build_system_prompt,
+    ensure_chat_session,
+    journey_can_access,
+    partner_context_for_llm,
+)
 from _rag_conv import conv_rag_available, retrieve_similar_conversations
 from _ui import JOURNEY_COACH, openai_key_configured, render_page_header, render_page_shell, render_trust_footer
 
 MESSAGES_KEY = "messages_coach"
 COACH_EXTERNAL_PASTE_KEY = "coach_external_paste"
+COACH_EXTERNAL_PASTE_DRAFT_KEY = "coach_external_paste_draft"
 COACH_VISION_TRANSCRIPT_KEY = "coach_vision_transcript"
+COACH_VISION_TRANSCRIPT_DRAFT_KEY = "coach_vision_transcript_draft"
 _CLEAR_COACH_PASTE_REQUEST = "_clear_coach_paste_request"
 _CLEAR_COACH_VISION_REQUEST = "_clear_coach_vision_request"
 COACH_OUT_PRACTICE = "_coach_side_out_practice"
@@ -33,8 +42,152 @@ COACH_OUT_REFERENCE_VISION = "_coach_side_out_reference_vision"
 DANGER_REPORT_PRACTICE = "_danger_report_practice"
 DANGER_REPORT_REFERENCE_PASTE = "_danger_report_reference_paste"
 DANGER_REPORT_REFERENCE_VISION = "_danger_report_reference_vision"
+COACH_SCENARIO_PRACTICE_KEY = "coach_scenario_context_practice"
+COACH_SCENARIO_REFERENCE_KEY = "coach_scenario_context_reference"
+COACH_DOMAIN_PRACTICE_KEY = "coach_conversation_domain_practice"
+COACH_DOMAIN_REFERENCE_KEY = "coach_conversation_domain_reference"
+COACH_DOMAIN_OTHER_HINT_PRACTICE = "coach_domain_other_hint_practice"
+COACH_DOMAIN_OTHER_HINT_REFERENCE = "coach_domain_other_hint_reference"
+
+OTHER_DOMAIN_ID = "other"
 
 VOTE_UI_HTML = "vote_ui_html"
+
+# (id, UI 라벨, LLM용 코칭 규칙) — 멘트·투표·RAG·위험 분석에 공통 주입
+CONVERSATION_DOMAINS: tuple[tuple[str, str, str], ...] = (
+    (
+        "dating_first_meet",
+        "첫 만남·대면 (1:1)",
+        "- **1:1** 소개팅·첫 만남 장면으로 해석한다.\n"
+        "- 인사와 서로 알아가는 톤이 자연스럽다.\n"
+        "- 상대 프로필(취미·관심사)은 **대화에서 그 주제가 나온 뒤**에만 짧게 연결한다.\n",
+    ),
+    (
+        "dating_messenger",
+        "만나기 전 카톡·DM",
+        "- **만나기 전** 메신저로 연락하는 단계로 본다.\n"
+        "- 짧고 예의 있는 문장, 과한 친밀·강요는 피한다.\n"
+        "- **대화에 실제로 나온 내용**(약속, 장소, 시간)에만 맞춘다.\n",
+    ),
+    (
+        "dating_after_meet",
+        "만남 후 재연락",
+        "- 이미 **한번 만난 뒤** 후속 연락 톤으로 본다.\n"
+        "- 감사·인상·다음 만남 제안이 자연스러울 수 있다.\n"
+        "- **대화에 언급된 것**에만 반응하고, 없는 일을 지어내지 않는다.\n",
+    ),
+    (
+        "group_or_social_chat",
+        "단체·오픈채·가벼운 메신저",
+        "- **1:1 데이트**가 아니라 여럿이 오가는 방·모임·가벼운 단체맥락일 수 있다.\n"
+        "- 짧은 응원·공감·안부가 어울릴 수 있으며, **로맨틱 1:1 소개팅 코칭 톤**으로 바꾸지 마라.\n"
+        "- 프로필·소개팅 상대 정보는 **이 맥락과 무관하면 쓰지 마라.**\n",
+    ),
+    (
+        "support_serious",
+        "위로·건강·기도·진지한 주제",
+        "- **통증, 가족, 건강, 기도 제목** 등 진지한 주제일 수 있다.\n"
+        "- 가볍게 넘기거나 데이트용 농담으로 바꾸지 마라. **공감·경청·신중한 한두 문장**이 맞다.\n"
+        "- 종교적 표현은 **대화에 그런 맥락이 있을 때만** 자연스럽게 허용한다.\n",
+    ),
+    (
+        "tension_repair",
+        "오해·갈등·사과",
+        "- **오해, 실망, 거리두기** 등 민감한 구간으로 본다.\n"
+        "- 방어·공격적 표현은 피하고, **사실 확인·사과·경청** 쪽을 우선한다.\n"
+        "- 없었던 일·과장된 약속을 만들어내지 마라.\n",
+    ),
+    (
+        OTHER_DOMAIN_ID,
+        "기타",
+        "- 아래 **사용자가 적은 기타 설명**(있다면)과 **실제 대화**를 근거로 톤·목표를 정한다.\n"
+        "- 소개팅·1:1 데이트로 단정하지 말고, 설명이 비어 있으면 대화만 보고 중립적으로 맞춘다.\n"
+        "- 대화에 없는 설정·주제를 만들어 붙이지 마라.\n",
+    ),
+)
+
+_DOMAIN_IDS = [d[0] for d in CONVERSATION_DOMAINS]
+_DOMAIN_LABELS = {d[0]: d[1] for d in CONVERSATION_DOMAINS}
+
+
+def normalize_coach_domain_id(raw: str | None) -> str:
+    rid = (raw or "").strip()
+    if rid in _DOMAIN_IDS:
+        return rid
+    return CONVERSATION_DOMAINS[0][0]
+
+
+def domain_instructions_block(domain_id: str | None, *, other_hint: str = "") -> str:
+    did = normalize_coach_domain_id(domain_id)
+    for xdid, _lab, instr in CONVERSATION_DOMAINS:
+        if xdid == did:
+            lab = _DOMAIN_LABELS.get(did, did)
+            block = f"# 코칭 기준: 대화 유형\n(선택: {lab})\n{instr}\n\n"
+            if did == OTHER_DOMAIN_ID:
+                oh = (other_hint or "").strip()
+                if oh:
+                    block += f"## 사용자 지정(기타) 보조 설명\n{oh}\n\n"
+            return block
+    return domain_instructions_block(CONVERSATION_DOMAINS[0][0])
+
+
+def domain_label(domain_id: str | None, other_hint: str = "") -> str:
+    did = normalize_coach_domain_id(domain_id)
+    base = _DOMAIN_LABELS.get(did, _DOMAIN_LABELS[CONVERSATION_DOMAINS[0][0]])
+    if did != OTHER_DOMAIN_ID:
+        return base
+    oh = (other_hint or "").strip().replace("\n", " ")
+    if oh:
+        if len(oh) > 72:
+            oh = oh[:69] + "…"
+        return f"기타 ({oh})"
+    return base
+
+
+def ensure_coach_domain_session(key: str) -> None:
+    if key not in st.session_state:
+        st.session_state[key] = CONVERSATION_DOMAINS[0][0]
+    elif st.session_state[key] not in _DOMAIN_IDS:
+        st.session_state[key] = CONVERSATION_DOMAINS[0][0]
+
+
+def render_coach_domain_expander(
+    *,
+    domain_session_key: str,
+    other_hint_key: str,
+    title: str,
+    caption: str,
+    other_placeholder: str = "예: 직장 동료와 업무 외 짧은 잡담, 선배–후배 관계",
+) -> None:
+    """배경·상황 설명과 동일하게 접이식 헤더 안에 대화 유형 선택을 둡니다."""
+    ensure_coach_domain_session(domain_session_key)
+    with st.expander(title, expanded=False):
+        st.caption(caption)
+        st.selectbox(
+            "유형 선택",
+            options=_DOMAIN_IDS,
+            format_func=lambda x: _DOMAIN_LABELS[x],
+            key=domain_session_key,
+            label_visibility="collapsed",
+        )
+        if st.session_state.get(domain_session_key) == OTHER_DOMAIN_ID:
+            st.text_area(
+                "기타 — 코칭에 참고할 설명 (선택)",
+                key=other_hint_key,
+                height=72,
+                placeholder=other_placeholder,
+            )
+
+
+def coach_scenario_plain(state_key: str) -> str:
+    return (st.session_state.get(state_key) or "").strip()
+
+
+def coach_scenario_section(state_key: str) -> str:
+    s = coach_scenario_plain(state_key)
+    if not s:
+        return ""
+    return f"# 사용자가 알려준 배경·상황\n{s}\n\n"
 
 
 def _sentiment_chip_style(sentiment: str) -> str:
@@ -58,6 +211,65 @@ def _sentiment_chip_style(sentiment: str) -> str:
 
 def _vote_body_html(text: str) -> str:
     return html.escape(text or "").replace("\n", "<br/>")
+
+
+def _ment_mood_chip_style(sentiment: str) -> str:
+    """짧은 멘트의 분위기 한 단어용 칩. 영문 Positive 등은 투표 칩 색상 재사용."""
+    if re.search(r"positive|negative|neutral", sentiment or "", re.I):
+        return _sentiment_chip_style(sentiment)
+    return (
+        "background:linear-gradient(180deg,#fff7ed,#ffedd5);color:#9a3412;"
+        "border:1px solid #fdba74;box-shadow:0 1px 3px rgba(154,52,18,0.12);"
+    )
+
+
+def format_ment_suggestion_html(sentiment: str, suggestion_text: str) -> str:
+    """짧은 멘트: 분위기 칩 + 추천 문장 말풍선."""
+    sent = (sentiment or "").strip()
+    chip = _ment_mood_chip_style(sent)
+    label = html.escape(sent or "—")
+    inner = _vote_body_html(suggestion_text)
+    return (
+        '<div style="margin-top:6px;">'
+        '<div style="margin-bottom:10px;">'
+        f'<span style="display:inline-flex;align-items:center;justify-content:center;'
+        f'padding:6px 16px;border-radius:9999px;font-size:0.8rem;font-weight:700;'
+        f'letter-spacing:0.02em;user-select:none;{chip}\">{label}</span>'
+        "</div>"
+        '<div style="position:relative;display:inline-block;max-width:100%;">'
+        '<div style="background:linear-gradient(165deg,#fffefb 0%,#fff5f5 100%);'
+        "border:1px solid #edd8d8;border-radius:22px 22px 22px 10px;"
+        "padding:16px 18px 18px;box-shadow:0 4px 18px rgba(124,45,18,0.08);"
+        f'color:#3f2e1f;line-height:1.6;font-size:1rem;">{inner}</div>'
+        '<span style="position:absolute;left:22px;bottom:-7px;width:12px;height:12px;'
+        "background:linear-gradient(165deg,#fffefb 0%,#fff5f5 100%);"
+        "border-right:1px solid #edd8d8;border-bottom:1px solid #edd8d8;"
+        'transform:rotate(45deg);display:block;"></span>'
+        "</div></div>"
+    )
+
+
+def render_coach_ment_output(state_key: str) -> None:
+    """세션에 저장된 짧은 멘트( dict·구버전 문자열·오류 ) 표시."""
+    raw = st.session_state.get(state_key)
+    if raw is None:
+        return
+    if isinstance(raw, dict) and raw.get("_ment") is True:
+        st.markdown(
+            format_ment_suggestion_html(
+                str(raw.get("sentiment", "") or ""),
+                str(raw.get("text", "") or ""),
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+    if isinstance(raw, str):
+        if raw.startswith("오류:"):
+            st.error(raw)
+        else:
+            st.markdown(raw)
+        return
+    st.markdown(str(raw))
 
 
 def _suggestion_field(s: object, key: str, default: str = "") -> str:
@@ -145,14 +357,14 @@ def write_vote_suggestion_chunk(chunk) -> None:
 
 
 MODE_DEFS = [
-    ("ment", "💬 짧은 멘트만", "지금 이어갈 **한두 문장**만 빠르게 추천해요."),
+    ("ment", "💬 한마디 추천", "지금 분위기에 맞는 **짧은 문장** 한두 개만 골라 줍니다."),
     (
         "rag",
-        "📚 대화 예시 참고 → 조언",
-        "먼저 저장된 **대화 스크립트** 중 비슷한 걸 찾고, 그걸 근거로 **코칭 조언**을 씁니다. (참고=대화, 결과=조언)",
+        "📚 예시 대화 · 코칭",
+        "비슷한 **대화 샘플**을 찾아 붙인 뒤, 그걸 참고해 **다음 멘트·태도**를 조언합니다.",
     ),
-    ("vote", "🗳️ 여러 조언 후 고르기", "여러 조언을 만든 뒤 가장 나은 하나를 골라요."),
-    ("danger", "🚨 위험 신호 감지", "대화에서 주의해야 할 패턴을 분석합니다."),
+    ("vote", "🗳️ 조언 후보 비교", "여러 스타일의 **조언 초안**을 만든 다음, 가장 나은 하나를 고릅니다."),
+    ("danger", "⚠️ 대화 패턴 점검", "한쪽 쏠림·무응·어조 등 **주의할 흐름**을 짚어 봅니다."),
 ]
 
 
@@ -163,6 +375,20 @@ def build_practice_conv(messages: list, user_label: str, partner_label: str) -> 
         name = user_label if message["role"] == "user" else partner_label
         conv += f"{name}: {message['content']}\n"
     return conv.strip()
+
+
+def reset_practice_chat_messages() -> None:
+    """연습 채팅을 시스템 프롬프트만 남기고 비우고, 연습 도우미 출력도 초기화."""
+    match = st.session_state.get(MATCHED_PROFILE_KEY)
+    user_me = st.session_state.get(USER_AI_PROFILE_KEY)
+    if not isinstance(user_me, dict):
+        user_me = None
+    st.session_state[MESSAGES_KEY] = [
+        {"role": "system", "content": build_system_prompt(match, user_me)},
+    ]
+    st.session_state.pop(DANGER_REPORT_PRACTICE, None)
+    st.session_state.pop(COACH_OUT_PRACTICE, None)
+    st.session_state.pop("_danger_alerted", None)
 
 
 def build_reference_paste_conv() -> str:
@@ -209,13 +435,23 @@ def run_vision_transcribe_screenshot(image_bytes: bytes, mime: str) -> str:
 
 
 class MentOut(BaseModel):
-    sentiment: str = Field(description="대화의 분위기 한 단어(예: 인사, 가벼운 대화)")
+    sentiment: str = Field(
+        description="분위기 한 단어(예: 인사, 가벼운 톤, 진지함, 위로, 단체·응원, 갈등·신중, 애매함)"
+    )
     suggestion_text: str = Field(
-        description="추천 발화: 위 대화에 실제로 등장한 주제에만 맞출 것"
+        description="추천 발화: 위 대화에 실제로 등장한 주제·선택한 대화 유형에만 맞출 것"
     )
 
 
-def run_ment_suggestion(user_label: str, partner_label: str, *, conv: str, source_blurb: str) -> dict:
+def run_ment_suggestion(
+    user_label: str,
+    partner_label: str,
+    *,
+    conv: str,
+    source_blurb: str,
+    scenario_section: str = "",
+    domain_section: str = "",
+) -> dict:
     match = st.session_state.get(MATCHED_PROFILE_KEY)
 
     model = ChatOpenAI(model="gpt-4o-mini", temperature=0.45)
@@ -224,23 +460,31 @@ def run_ment_suggestion(user_label: str, partner_label: str, *, conv: str, sourc
     partner_ctx = partner_context_for_llm(match, user_label)
     tpl = HumanMessagePromptTemplate.from_template(
         "{partner_ctx}\n\n"
+        "{scenario_section}"
+        "{domain_section}"
         "아래는 {source_blurb}\n"
         "{conv}\n"
         "---\n"
-        "위 내용은 소개팅·만남 준비 상황의 대화로 간주한다.\n"
+        "앱의 **전체 목적**은 만남·인간관계 연습이다. 위 **대화 유형**·배경·**실제 대화 텍스트**를 최우선으로 해석하고, "
+        "유형과 어긋나게 '카페 소개팅 한 장면'만 상상하지 마라.\n\n"
         "【반드시 지킬 것】\n"
-        "1) **대화에 실제로 나온 말에만** 이어 붙인다. 여행·취미·음식·영화 등 **아무도 언급하지 않은 주제를 새로 꺼내지 마라.**\n"
-        "2) 아직 인사·안부·짧은 질문만 오갔다면, 상대의 **마지막 발화에 답하거나** 같은 톤으로 짧게 반응하는 멘트만 추천한다. "
-        "(예: 상대가 \"어떻게 지내셨어요?\"라고 했으면 그 질문에 답하는 한두 문장)\n"
-        "3) 위에 있는 **상대 프로필**(관심 키워드·소개 등)은 참고용이다. 대화가 아직 인사·첫 질문 단계이면 "
-        "**프로필에 나온 취미·여행 등을 멘트에 끌어오지 마라.** (대화에서 그 주제가 나온 뒤에만 자연스럽게 연결 가능)\n"
-        "4) 추천 멘트는 한두 문장, 과장·설정 추가 금지.\n"
+        "1) **대화에 실제로 나온 말에만** 이어 붙인다. 아무도 언급하지 않은 주제를 새로 꺼내지 마라.\n"
+        "2) 아직 인사·안부·짧은 질문만 오갔다면, 상대의 **마지막 발화에 답하거나** 그 유형에 맞는 짧은 반응만 추천한다.\n"
+        "3) **상대 프로필**은 참고용이다. 인사·첫 질문 단계이거나 단체·위로 맥락이면 프로필을 멘트에 끌어오지 마라.\n"
+        "4) 추천 멘트는 한두 문장, 과장·추가 설정 금지.\n"
         "{name}가 지금 이어서 하면 좋을 **짧은 멘트 한 가지**를 추천하라.\n"
         "{format_instructions}"
     )
     chain = ChatPromptTemplate.from_messages([tpl]).partial(format_instructions=fmt) | model | parser
     return chain.invoke(
-        {"conv": conv, "name": user_label, "partner_ctx": partner_ctx, "source_blurb": source_blurb}
+        {
+            "conv": conv,
+            "name": user_label,
+            "partner_ctx": partner_ctx,
+            "source_blurb": source_blurb,
+            "scenario_section": scenario_section or "",
+            "domain_section": domain_section or "",
+        }
     )
 
 
@@ -249,7 +493,15 @@ class Suggestion(BaseModel):
     suggestion_text: str = Field(description="markdown 형식의 조언")
 
 
-def stream_vote_suggestion(conv: str, user_label: str, partner_label: str, num_candi: int = 5):
+def stream_vote_suggestion(
+    conv: str,
+    user_label: str,
+    partner_label: str,
+    num_candi: int = 5,
+    *,
+    scenario_section: str = "",
+    domain_section: str = "",
+):
     match = st.session_state.get(MATCHED_PROFILE_KEY)
     partner_ctx = partner_context_for_llm(match, user_label)
 
@@ -260,8 +512,11 @@ def stream_vote_suggestion(conv: str, user_label: str, partner_label: str, num_c
     fmt = parser.get_format_instructions()
     human1 = HumanMessagePromptTemplate.from_template(
         "{partner_ctx}\n\n"
+        "{scenario_section}"
+        "{domain_section}"
         "{conv}\n"
-        "위 소개팅 대화를 분석하고 {name}에게 markdown으로 적절한 조언을 하라.\n"
+        "위 대화를 **선택한 대화 유형**에 맞게 분석하고 {name}에게 markdown으로 적절한 조언을 하라. "
+        "1:1 소개팅만 전제로 하지 마라.\n"
         "{format_instructions}"
     )
     gen_chain = ChatPromptTemplate.from_messages([human1]).partial(format_instructions=fmt) | basic_model | parser
@@ -274,16 +529,23 @@ def stream_vote_suggestion(conv: str, user_label: str, partner_label: str, num_c
     vfmt = vparser.get_format_instructions()
     human2 = HumanMessagePromptTemplate.from_template(
         "{partner_ctx}\n\n"
+        "{scenario_section}"
+        "{domain_section}"
         "{conv}\n"
-        "아래는 {name}에게 하면 좋을 조언 후보들이다. 가장 좋은 것 하나를 고르고 번호를 응답하라.\n"
+        "아래는 {name}에게 하면 좋을 조언 후보들이다. **대화 유형**에 가장 잘 맞는 하나를 고르고 번호를 응답하라.\n"
         "{candidates}\n"
         "{format_instructions}"
     )
     vote_chain = ChatPromptTemplate.from_messages([human2]).partial(format_instructions=vfmt) | eval_model | vparser
 
-    suggestion_list = gen_chain.batch(
-        [{"conv": conv, "name": user_label, "partner_ctx": partner_ctx}] * num_candi
-    )
+    batch_common = {
+        "conv": conv,
+        "name": user_label,
+        "partner_ctx": partner_ctx,
+        "scenario_section": scenario_section or "",
+        "domain_section": domain_section or "",
+    }
+    suggestion_list = gen_chain.batch([batch_common] * num_candi)
     yield (VOTE_UI_HTML, format_vote_candidates_html(suggestion_list))
     cand_text = "\n\n".join(
         [
@@ -292,7 +554,17 @@ def stream_vote_suggestion(conv: str, user_label: str, partner_label: str, num_c
         ]
     )
     votes = vote_chain.batch(
-        [{"conv": conv, "name": user_label, "candidates": cand_text, "partner_ctx": partner_ctx}] * num_candi
+        [
+            {
+                "conv": conv,
+                "name": user_label,
+                "candidates": cand_text,
+                "partner_ctx": partner_ctx,
+                "scenario_section": scenario_section or "",
+                "domain_section": domain_section or "",
+            }
+        ]
+        * num_candi
     )
     df = pd.DataFrame(votes)
     yield "### 투표 요약\n"
@@ -310,34 +582,57 @@ def stream_vote_suggestion(conv: str, user_label: str, partner_label: str, num_c
     yield (VOTE_UI_HTML, format_vote_best_html(best_n, best))
 
 
-def prepare_rag_suggestion(user_label: str, partner_label: str, conv: str) -> tuple[str, str, str]:
+def prepare_rag_suggestion(
+    user_label: str,
+    partner_label: str,
+    conv: str,
+    *,
+    scenario_hint: str = "",
+    domain_id: str | None = None,
+    domain_other_hint: str = "",
+) -> tuple[str, str, str]:
     match = st.session_state.get(MATCHED_PROFILE_KEY)
     partner_ctx = partner_context_for_llm(match, user_label)
 
-    query = conv.strip() or "소개팅에서 처음 만나는 대화"
+    base = conv.strip() or "소개팅에서 처음 만나는 대화"
+    sh = (scenario_hint or "").strip()
+    query = f"{base}\n{sh}" if sh else base
+    dom_lab = domain_label(domain_id, domain_other_hint)
+    query = f"{query}\n(코칭 맥락: {dom_lab})"
     context = retrieve_similar_conversations(query, k=4)
     if not context.strip():
         context = "(유사 샘플을 찾지 못했습니다. 일반적인 조언만 해 주세요.)"
     return partner_ctx, conv, context
 
 
-def stream_rag_suggestion_prepared(partner_ctx: str, conv: str, context: str):
+def stream_rag_suggestion_prepared(
+    partner_ctx: str,
+    conv: str,
+    context: str,
+    *,
+    scenario_section: str = "",
+    domain_section: str = "",
+):
     model = ChatOpenAI(model="gpt-4o", temperature=0.8)
     template = """
 {partner_ctx}
 
-# 현재 대화
+{scenario_section}{domain_section}# 현재 대화
 {conv}
 
 # 검색으로 붙인 유사 대화 예시 (참고용 스크립트)
 {context}
 
 위 **유사 대화 예시**를 한두 문장으로 짚어 왜 참고가 됐는지 말한 뒤,
-현재 대화에 맞는 **짧은 코칭 조언**(다음에 할 말·태도)을 해줘.
-조언은 불릿 2~3개 정도로.
+**선택한 대화 유형**·배경·현재 대화에 맞는 **짧은 코칭 조언**(다음에 할 말·태도)을 해줘.
+1:1 소개팅만 전제로 하지 마라. 조언은 불릿 2~3개 정도로.
 """
     prompt = ChatPromptTemplate.from_template(template).partial(
-        partner_ctx=partner_ctx, conv=conv, context=context
+        partner_ctx=partner_ctx,
+        conv=conv,
+        context=context,
+        scenario_section=scenario_section or "",
+        domain_section=domain_section or "",
     )
     chain = prompt | model | StrOutputParser()
     return chain.stream({})
@@ -441,15 +736,27 @@ class DangerReport(BaseModel):
 
 
 @st.cache_data(show_spinner=False)
-def analyze_danger_signals(conv_text: str, user_label: str) -> dict:
+def analyze_danger_signals(
+    conv_text: str,
+    user_label: str,
+    scenario_hint: str = "",
+    domain_section: str = "",
+) -> dict:
     """대화에서 위험 신호 감지 (캐시 적용)."""
     model = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
     parser = JsonOutputParser(pydantic_object=DangerReport)
     fmt = parser.get_format_instructions()
+    scen = (scenario_hint or "").strip() or "(없음)"
+    dom = (domain_section or "").strip()
 
     prompt = ChatPromptTemplate.from_template(
-        "소개팅 대화를 분석하여 위험 신호를 감지하라. {user_label} 관점에서 평가.\n\n"
+        "대화에서 위험·불균형 신호를 감지하라. {user_label} 관점에서 평가.\n\n"
+        "{domain_section}"
+        "사용자가 알려준 배경·상황(있다면 참고):\n{scenario}\n\n"
         "대화:\n{conv}\n\n"
+        "**대화 유형**에 맞게 '위험'의 의미를 조정하라. "
+        "(예: 단체·위로 맥락에서는 가벼운 응원을 데이트 실패처럼 과대평가하지 마라. "
+        "1:1 만남·사적 연락에서는 프라이버시·과도한 친밀·강요를 더 엄격히 본다.)\n\n"
         "분석 기준:\n"
         "1. 한쪽 쏠림: 한 사람이 질문·발화를 독점하는 정도\n"
         "2. 개인정보 위험: 전화번호·주소·직장 등 민감 정보 요구\n"
@@ -459,7 +766,14 @@ def analyze_danger_signals(conv_text: str, user_label: str) -> dict:
         "{format_instructions}"
     )
     chain = prompt.partial(format_instructions=fmt) | model | parser
-    return chain.invoke({"conv": conv_text, "user_label": user_label})
+    return chain.invoke(
+        {
+            "conv": conv_text,
+            "user_label": user_label,
+            "scenario": scen,
+            "domain_section": dom + "\n\n" if dom else "",
+        }
+    )
 
 
 def render_danger_panel(
@@ -470,6 +784,8 @@ def render_danger_panel(
     report_state_key: str,
     analyze_button_key: str,
     empty_hint: str,
+    scenario_hint: str = "",
+    domain_section: str = "",
 ):
     """[E] 위험 신호 분석 패널 (연습/참고 탭별로 키 분리)."""
     if not conv.strip():
@@ -477,14 +793,19 @@ def render_danger_panel(
         return
 
     if st.button(
-        "🚨 위험 신호 분석 실행",
+        "⚠️ 대화 패턴 분석",
         type="primary",
         use_container_width=True,
         key=analyze_button_key,
     ):
         with st.spinner("대화 패턴을 분석 중…"):
             try:
-                report = analyze_danger_signals(conv, user_label)
+                report = analyze_danger_signals(
+                    conv,
+                    user_label,
+                    scenario_hint=scenario_hint,
+                    domain_section=domain_section,
+                )
                 st.session_state[report_state_key] = report
                 st.rerun()
             except Exception as e:
@@ -558,6 +879,19 @@ def render_danger_panel(
 st.set_page_config(page_title="통합 데이팅 AI", layout="wide", page_icon="💬")
 render_page_shell(journey_step=JOURNEY_COACH)
 
+_ok4, _msg4 = journey_can_access("coach")
+if not _ok4:
+    st.error(_msg4)
+    ca, cb, cc = st.columns(3)
+    with ca:
+        st.page_link("pages/01_AI_프로필_생성.py", label="① 프로필", use_container_width=True)
+    with cb:
+        st.page_link("pages/02_프로필_매칭_검색.py", label="② 매칭", use_container_width=True)
+    with cc:
+        st.page_link("pages/03_인사말_생성.py", label="③ 인사말", use_container_width=True)
+    render_trust_footer()
+    st.stop()
+
 MENT_SOURCE_PRACTICE = "앱 안 **연습 채팅**에서 주고받은 대화이다."
 MENT_SOURCE_REFERENCE_PASTE = "**카톡·메신저 등에서 붙여넣은** 대화 텍스트이다 (연습·스크린샷 추출과 별도)."
 MENT_SOURCE_REFERENCE_VISION = "**스크린샷에서 추출·편집한** 대화 텍스트이다 (연습·붙여넣기와 별도)."
@@ -565,7 +899,7 @@ MENT_SOURCE_REFERENCE_VISION = "**스크린샷에서 추출·편집한** 대화 
 render_page_header(
     kicker="Step ④ · 대화",
     title="대화 연습 · 코칭",
-    subtitle="**연습 채팅**과 **참고 맥락**은 분리되어 있고, 참고 맥락 안에서도 **붙여넣기**와 **스크린샷 추출**은 각각 전용 도우미·저장 키로 나뉩니다.",
+    subtitle="**연습 채팅**과 **참고 맥락**은 분리되어 있으며, 각 탭의 **배경·상황** 입력이 도우미·연습 상대 응답에 반영됩니다. 참고 맥락에서는 **붙여넣기**와 **스크린샷 추출**이 전용 도우미·저장으로 나뉩니다.",
 )
 
 if not openai_key_configured():
@@ -591,10 +925,12 @@ messages = st.session_state[MESSAGES_KEY]
 # 위젯(key) 생성 전에만 외부 맥락 키를 지울 수 있음 (내용 지우기 버튼은 플래그 + rerun 후 여기서 처리)
 if st.session_state.pop(_CLEAR_COACH_PASTE_REQUEST, False):
     st.session_state.pop(COACH_EXTERNAL_PASTE_KEY, None)
+    st.session_state.pop(COACH_EXTERNAL_PASTE_DRAFT_KEY, None)
     st.session_state.pop(COACH_OUT_REFERENCE_PASTE, None)
     st.session_state.pop(DANGER_REPORT_REFERENCE_PASTE, None)
 if st.session_state.pop(_CLEAR_COACH_VISION_REQUEST, False):
     st.session_state.pop(COACH_VISION_TRANSCRIPT_KEY, None)
+    st.session_state.pop(COACH_VISION_TRANSCRIPT_DRAFT_KEY, None)
     st.session_state.pop(COACH_OUT_REFERENCE_VISION, None)
     st.session_state.pop(DANGER_REPORT_REFERENCE_VISION, None)
 
@@ -606,6 +942,15 @@ else:
 
 if COACH_VISION_TRANSCRIPT_KEY not in st.session_state:
     st.session_state[COACH_VISION_TRANSCRIPT_KEY] = ""
+if COACH_VISION_TRANSCRIPT_DRAFT_KEY not in st.session_state:
+    st.session_state[COACH_VISION_TRANSCRIPT_DRAFT_KEY] = (
+        st.session_state.get(COACH_VISION_TRANSCRIPT_KEY) or ""
+    )
+
+if COACH_EXTERNAL_PASTE_DRAFT_KEY not in st.session_state:
+    st.session_state[COACH_EXTERNAL_PASTE_DRAFT_KEY] = (
+        st.session_state.get(COACH_EXTERNAL_PASTE_KEY) or ""
+    )
 
 tab_practice, tab_reference = st.tabs(["연습 채팅", "참고 맥락"])
 
@@ -617,12 +962,44 @@ with tab_practice:
 
     with col_chat:
         with st.container(border=True):
-            st.markdown("**🎭 상대 역할과 주고받기**")
+            rh1, rh2 = st.columns([2, 1])
+            with rh1:
+                st.markdown("**🎭 상대 역할과 주고받기**")
+            with rh2:
+                if st.button(
+                    "연습 초기화",
+                    use_container_width=True,
+                    key="practice_chat_reset",
+                    help="대화를 지우고 현재 매칭·프로필 기준으로 처음부터 연습합니다.",
+                ):
+                    reset_practice_chat_messages()
+                    st.toast("연습 대화를 초기화했습니다.", icon="🔄")
+                    st.rerun()
             st.caption("아래 입력은 **연습 전용**입니다. 카톡 로그는 **참고 맥락** 탭에서 다룹니다.")
+            with st.expander("배경·상황 설명 (선택)", expanded=False):
+                st.caption(
+                    "장소, 관계(첫만남·재회), 분위기 등을 적으면 **연습 상대(챗) 응답**과 오른쪽 **도우미**가 맞춰집니다."
+                )
+                st.text_area(
+                    "연습 배경 맥락",
+                    key=COACH_SCENARIO_PRACTICE_KEY,
+                    height=88,
+                    placeholder="예: 첫 소개팅, 조용한 카페, 서로 어색한 편",
+                )
+
+            render_coach_domain_expander(
+                domain_session_key=COACH_DOMAIN_PRACTICE_KEY,
+                other_hint_key=COACH_DOMAIN_OTHER_HINT_PRACTICE,
+                title="대화 유형 (선택)",
+                caption=(
+                    "첫만남·카톡·단체·위로 등 **맥락**에 맞춰 멘트·코칭 톤이 달라집니다. "
+                    "오른쪽 도우미에도 동일하게 적용됩니다."
+                ),
+            )
 
             user_turns = sum(1 for m in messages[1:] if m["role"] == "user")
             if user_turns >= 5 and not st.session_state.get("_danger_alerted"):
-                st.toast("💡 연습이 5턴을 넘었습니다. 오른쪽에서 위험 신호를 분석해 보세요!", icon="🚨")
+                st.toast("💡 연습이 5턴을 넘었습니다. 오른쪽에서 대화 패턴 점검을 써 보세요!", icon="⚠️")
                 st.session_state["_danger_alerted"] = True
 
             for m in messages[1:]:
@@ -636,7 +1013,14 @@ with tab_practice:
 
                 api_key = os.environ.get("OPENAI_API_KEY", "").strip()
                 client = OpenAI(api_key=api_key) if api_key else OpenAI()
-                api_msgs = [{"role": x["role"], "content": x["content"]} for x in messages]
+                base_sys = messages[0]["content"]
+                sc_chat = coach_scenario_plain(COACH_SCENARIO_PRACTICE_KEY)
+                sys_content = (
+                    f"{base_sys}\n\n[이번 연습의 배경·상황]\n{sc_chat}" if sc_chat else base_sys
+                )
+                api_msgs = [{"role": "system", "content": sys_content}] + [
+                    {"role": x["role"], "content": x["content"]} for x in messages[1:]
+                ]
                 with st.spinner("응답 생성 중…"):
                     try:
                         resp = client.chat.completions.create(
@@ -651,8 +1035,19 @@ with tab_practice:
                 st.rerun()
 
     with col_panel:
+        sc_sec_practice = coach_scenario_section(COACH_SCENARIO_PRACTICE_KEY)
+        sc_plain_practice = coach_scenario_plain(COACH_SCENARIO_PRACTICE_KEY)
+        ensure_coach_domain_session(COACH_DOMAIN_PRACTICE_KEY)
+        dom_id_practice = normalize_coach_domain_id(st.session_state.get(COACH_DOMAIN_PRACTICE_KEY))
+        _hint_p = (st.session_state.get(COACH_DOMAIN_OTHER_HINT_PRACTICE) or "").strip()
+        dom_sec_practice = domain_instructions_block(
+            dom_id_practice,
+            other_hint=_hint_p if dom_id_practice == OTHER_DOMAIN_ID else "",
+        )
         st.subheader("도우미 (연습)")
-        st.caption("맥락: **연습 채팅만**")
+        st.caption(
+            "맥락: **연습 채팅만** · 왼쪽 **대화 유형·배경·상황**이 있으면 함께 반영됩니다."
+        )
         mode_p = st.radio(
             "모드",
             [m[0] for m in MODE_DEFS],
@@ -663,7 +1058,7 @@ with tab_practice:
         st.caption(next(d[2] for d in MODE_DEFS if d[0] == mode_p))
 
         if mode_p == "ment":
-            if st.button("짧은 멘트 추천", type="primary", use_container_width=True, key="ment_practice"):
+            if st.button("한마디 추천", type="primary", use_container_width=True, key="ment_practice"):
                 if not conv_p:
                     st.warning("먼저 왼쪽에서 **연습 채팅**을 이어 가 주세요.")
                 else:
@@ -674,24 +1069,27 @@ with tab_practice:
                                 partner_name,
                                 conv=conv_p,
                                 source_blurb=MENT_SOURCE_PRACTICE,
+                                scenario_section=sc_sec_practice,
+                                domain_section=dom_sec_practice,
                             )
-                            st.session_state[COACH_OUT_PRACTICE] = (
-                                f"**{out['sentiment']}**\n\n{out['suggestion_text']}"
-                            )
+                            st.session_state[COACH_OUT_PRACTICE] = {
+                                "_ment": True,
+                                "sentiment": out["sentiment"],
+                                "text": out["suggestion_text"],
+                            }
                         except Exception as e:
                             st.session_state[COACH_OUT_PRACTICE] = f"오류: {e}"
-            if COACH_OUT_PRACTICE in st.session_state:
-                st.markdown(st.session_state[COACH_OUT_PRACTICE])
+            render_coach_ment_output(COACH_OUT_PRACTICE)
 
         elif mode_p == "rag":
             if not conv_rag_available():
                 st.error("`data/conv_samples.jsonl` 이 없습니다.")
             else:
                 st.caption(
-                    "유사 대화 예시 검색 후 조언합니다. **첫 실행**에 임베딩 API가 잠깐 호출될 수 있어요."
+                    "비슷한 **대화 샘플**을 찾은 뒤 코칭합니다. **첫 실행**에 임베딩 API가 잠깐 호출될 수 있어요."
                 )
             if conv_rag_available() and st.button(
-                "유사 대화 예시 찾기 → 조언 받기",
+                "예시 찾고 코칭 받기",
                 type="primary",
                 use_container_width=True,
                 key="rag_practice",
@@ -701,7 +1099,12 @@ with tab_practice:
                 else:
                     try:
                         partner_ctx, conv_r, ctx_block = prepare_rag_suggestion(
-                            user_label, partner_name, conv_p
+                            user_label,
+                            partner_name,
+                            conv_p,
+                            scenario_hint=sc_plain_practice,
+                            domain_id=dom_id_practice,
+                            domain_other_hint=_hint_p if dom_id_practice == OTHER_DOMAIN_ID else "",
                         )
                         with st.expander("유사 대화 예시 · 검색 결과", expanded=True):
                             render_rag_examples_panel(ctx_block)
@@ -709,14 +1112,20 @@ with tab_practice:
                             st.markdown("**코칭 조언**")
                             with st.spinner("조언 생성…"):
                                 st.write_stream(
-                                    stream_rag_suggestion_prepared(partner_ctx, conv_r, ctx_block)
+                                    stream_rag_suggestion_prepared(
+                                        partner_ctx,
+                                        conv_r,
+                                        ctx_block,
+                                        scenario_section=sc_sec_practice,
+                                        domain_section=dom_sec_practice,
+                                    )
                                 )
                     except Exception as e:
                         st.error(str(e))
 
         elif mode_p == "vote":
             if st.button(
-                "여러 조언 생성 후 투표",
+                "조언 후보 만들고 투표",
                 type="primary",
                 use_container_width=True,
                 key="vote_practice",
@@ -726,7 +1135,13 @@ with tab_practice:
                 else:
                     with st.spinner("시간이 조금 걸릴 수 있어요…"):
                         try:
-                            for chunk in stream_vote_suggestion(conv_p, user_label, partner_name):
+                            for chunk in stream_vote_suggestion(
+                                conv_p,
+                                user_label,
+                                partner_name,
+                                scenario_section=sc_sec_practice,
+                                domain_section=dom_sec_practice,
+                            ):
                                 write_vote_suggestion_chunk(chunk)
                         except Exception as e:
                             st.error(str(e))
@@ -739,12 +1154,40 @@ with tab_practice:
                 report_state_key=DANGER_REPORT_PRACTICE,
                 analyze_button_key="danger_analyze_practice",
                 empty_hint="분석할 **연습 대화**가 없습니다. 왼쪽에서 채팅을 시작해 주세요.",
+                scenario_hint=sc_plain_practice,
+                domain_section=dom_sec_practice,
             )
 
 # ── 참고 맥락 탭 (붙여넣기 / 스크린샷 분리) ─────────────────
 with tab_reference:
     st.caption(
         "연습 채팅과 섞이지 않습니다. 아래 **붙여넣기**와 **스크린샷**은 서로 다른 맥락·도우미 결과로 관리됩니다."
+    )
+    with st.expander("배경·상황 설명 (선택)", expanded=False):
+        st.caption(
+            "대화가 나온 **상황**(예: 약속 조율, 첫 인사, 오해)을 적으면 붙여넣기·스크린샷 **도우미**가 더 맞춰집니다."
+        )
+        st.text_area(
+            "참고 맥락 배경",
+            key=COACH_SCENARIO_REFERENCE_KEY,
+            height=88,
+            placeholder="예: 카톡으로 약속 잡는 중, 상대가 답이 짧음",
+        )
+    render_coach_domain_expander(
+        domain_session_key=COACH_DOMAIN_REFERENCE_KEY,
+        other_hint_key=COACH_DOMAIN_OTHER_HINT_REFERENCE,
+        title="대화 유형 (선택)",
+        caption="붙여넣기·스크린샷 **도우미**에 공통 적용됩니다. 맥락에 맞는 유형을 고르면 코칭 톤이 맞춰집니다.",
+        other_placeholder="예: 가족 단톡에서 건강 이야기 중",
+    )
+    sc_sec_ref = coach_scenario_section(COACH_SCENARIO_REFERENCE_KEY)
+    sc_plain_ref = coach_scenario_plain(COACH_SCENARIO_REFERENCE_KEY)
+    ensure_coach_domain_session(COACH_DOMAIN_REFERENCE_KEY)
+    dom_id_ref = normalize_coach_domain_id(st.session_state.get(COACH_DOMAIN_REFERENCE_KEY))
+    _hint_r = (st.session_state.get(COACH_DOMAIN_OTHER_HINT_REFERENCE) or "").strip()
+    dom_sec_ref = domain_instructions_block(
+        dom_id_ref,
+        other_hint=_hint_r if dom_id_ref == OTHER_DOMAIN_ID else "",
     )
     sub_paste, sub_vision = st.tabs(["붙여넣기", "스크린샷"])
 
@@ -753,21 +1196,44 @@ with tab_reference:
         with cp1:
             with st.container(border=True):
                 st.markdown("**📋 붙여넣기 맥락**")
-                st.caption("카톡·메신저 로그를 그대로 붙입니다. 스크린샷 탭과 데이터가 섞이지 않습니다.")
+                st.caption(
+                    "카톡·메신저 로그를 붙인 뒤 **적용**을 눌러야 오른쪽 도우미 맥락에 반영됩니다. "
+                    "스크린샷 탭과 데이터가 섞이지 않습니다."
+                )
                 st.text_area(
                     "붙여넣기",
-                    key=COACH_EXTERNAL_PASTE_KEY,
+                    key=COACH_EXTERNAL_PASTE_DRAFT_KEY,
                     height=180,
                     placeholder="예: 나: 오늘 시간 돼?\n상대: 응 7시 어때",
                 )
-                if st.button("붙여넣기 내용 지우기", use_container_width=True, key="coach_clear_paste_ref"):
-                    st.session_state[_CLEAR_COACH_PASTE_REQUEST] = True
-                    st.rerun()
+                ap1, ap2 = st.columns(2)
+                with ap1:
+                    if st.button(
+                        "적용",
+                        type="primary",
+                        use_container_width=True,
+                        key="coach_apply_paste_ref",
+                    ):
+                        st.session_state[COACH_EXTERNAL_PASTE_KEY] = (
+                            st.session_state.get(COACH_EXTERNAL_PASTE_DRAFT_KEY) or ""
+                        )
+                        st.session_state.pop(COACH_OUT_REFERENCE_PASTE, None)
+                        st.session_state.pop(DANGER_REPORT_REFERENCE_PASTE, None)
+                        st.toast("도우미 맥락에 반영되었습니다.", icon="✅")
+                        st.rerun()
+                with ap2:
+                    if st.button(
+                        "내용 지우기",
+                        use_container_width=True,
+                        key="coach_clear_paste_ref",
+                    ):
+                        st.session_state[_CLEAR_COACH_PASTE_REQUEST] = True
+                        st.rerun()
 
         conv_paste = build_reference_paste_conv()
         with cp2:
             st.subheader("도우미 (붙여넣기)")
-            st.caption("맥락: **이 탭의 붙여넣기만**")
+            st.caption("맥락: **적용**한 붙여넣기 · 위 **배경·상황**이 있으면 함께 반영됩니다.")
             mode_rp = st.radio(
                 "모드",
                 [m[0] for m in MODE_DEFS],
@@ -778,9 +1244,9 @@ with tab_reference:
             st.caption(next(d[2] for d in MODE_DEFS if d[0] == mode_rp))
 
             if mode_rp == "ment":
-                if st.button("짧은 멘트 추천", type="primary", use_container_width=True, key="ment_ref_paste"):
+                if st.button("한마디 추천", type="primary", use_container_width=True, key="ment_ref_paste"):
                     if not conv_paste:
-                        st.warning("왼쪽 **붙여넣기**에 대화를 넣어 주세요.")
+                        st.warning("왼쪽에 대화를 붙인 뒤 **적용**을 눌러 주세요.")
                     else:
                         with st.spinner("멘트 생성…"):
                             try:
@@ -789,32 +1255,40 @@ with tab_reference:
                                     partner_name,
                                     conv=conv_paste,
                                     source_blurb=MENT_SOURCE_REFERENCE_PASTE,
+                                    scenario_section=sc_sec_ref,
+                                    domain_section=dom_sec_ref,
                                 )
-                                st.session_state[COACH_OUT_REFERENCE_PASTE] = (
-                                    f"**{out['sentiment']}**\n\n{out['suggestion_text']}"
-                                )
+                                st.session_state[COACH_OUT_REFERENCE_PASTE] = {
+                                    "_ment": True,
+                                    "sentiment": out["sentiment"],
+                                    "text": out["suggestion_text"],
+                                }
                             except Exception as e:
                                 st.session_state[COACH_OUT_REFERENCE_PASTE] = f"오류: {e}"
-                if COACH_OUT_REFERENCE_PASTE in st.session_state:
-                    st.markdown(st.session_state[COACH_OUT_REFERENCE_PASTE])
+                render_coach_ment_output(COACH_OUT_REFERENCE_PASTE)
 
             elif mode_rp == "rag":
                 if not conv_rag_available():
                     st.error("`data/conv_samples.jsonl` 이 없습니다.")
                 else:
-                    st.caption("유사 예시 검색 후 조언합니다.")
+                    st.caption("비슷한 샘플을 찾은 뒤 코칭합니다.")
                 if conv_rag_available() and st.button(
-                    "유사 대화 예시 찾기 → 조언 받기",
+                    "예시 찾고 코칭 받기",
                     type="primary",
                     use_container_width=True,
                     key="rag_ref_paste",
                 ):
                     if not conv_paste:
-                        st.warning("왼쪽 **붙여넣기**에 대화를 넣어 주세요.")
+                        st.warning("왼쪽에 대화를 붙인 뒤 **적용**을 눌러 주세요.")
                     else:
                         try:
                             partner_ctx, conv_rb, ctx_block = prepare_rag_suggestion(
-                                user_label, partner_name, conv_paste
+                                user_label,
+                                partner_name,
+                                conv_paste,
+                                scenario_hint=sc_plain_ref,
+                                domain_id=dom_id_ref,
+                                domain_other_hint=_hint_r if dom_id_ref == OTHER_DOMAIN_ID else "",
                             )
                             with st.expander("유사 대화 예시 · 검색 결과", expanded=True):
                                 render_rag_examples_panel(ctx_block)
@@ -822,24 +1296,36 @@ with tab_reference:
                                 st.markdown("**코칭 조언**")
                                 with st.spinner("조언 생성…"):
                                     st.write_stream(
-                                        stream_rag_suggestion_prepared(partner_ctx, conv_rb, ctx_block)
+                                        stream_rag_suggestion_prepared(
+                                            partner_ctx,
+                                            conv_rb,
+                                            ctx_block,
+                                            scenario_section=sc_sec_ref,
+                                            domain_section=dom_sec_ref,
+                                        )
                                     )
                         except Exception as e:
                             st.error(str(e))
 
             elif mode_rp == "vote":
                 if st.button(
-                    "여러 조언 생성 후 투표",
+                    "조언 후보 만들고 투표",
                     type="primary",
                     use_container_width=True,
                     key="vote_ref_paste",
                 ):
                     if not conv_paste:
-                        st.warning("왼쪽 **붙여넣기**에 대화를 넣어 주세요.")
+                        st.warning("왼쪽에 대화를 붙인 뒤 **적용**을 눌러 주세요.")
                     else:
                         with st.spinner("시간이 조금 걸릴 수 있어요…"):
                             try:
-                                for chunk in stream_vote_suggestion(conv_paste, user_label, partner_name):
+                                for chunk in stream_vote_suggestion(
+                                    conv_paste,
+                                    user_label,
+                                    partner_name,
+                                    scenario_section=sc_sec_ref,
+                                    domain_section=dom_sec_ref,
+                                ):
                                     write_vote_suggestion_chunk(chunk)
                             except Exception as e:
                                 st.error(str(e))
@@ -851,7 +1337,9 @@ with tab_reference:
                     conv=conv_paste,
                     report_state_key=DANGER_REPORT_REFERENCE_PASTE,
                     analyze_button_key="danger_analyze_ref_paste",
-                    empty_hint="분석할 **붙여넣기** 텍스트가 없습니다.",
+                    empty_hint="분석할 텍스트가 없습니다. 왼쪽에 붙인 뒤 **적용**을 눌러 주세요.",
+                    scenario_hint=sc_plain_ref,
+                    domain_section=dom_sec_ref,
                 )
 
     with sub_vision:
@@ -859,7 +1347,10 @@ with tab_reference:
         with cv1:
             with st.container(border=True):
                 st.markdown("**🖼 스크린샷 맥락**")
-                st.caption("이미지에서 대화를 읽어 옵니다. 붙여넣기 탭과 데이터가 섞이지 않습니다.")
+                st.caption(
+                    "이미지에서 대화를 읽어 옵니다. **추출·편집** 내용은 **적용** 후에 도우미 맥락에 반영됩니다. "
+                    "붙여넣기 탭과 데이터가 섞이지 않습니다."
+                )
                 up_v = st.file_uploader(
                     "스크린샷",
                     type=["png", "jpg", "jpeg", "webp"],
@@ -874,7 +1365,7 @@ with tab_reference:
                         key="coach_vision_btn_ref_v",
                     )
                 with ev2:
-                    if st.button("추출·편집 내용 지우기", use_container_width=True, key="coach_clear_vision_ref"):
+                    if st.button("내용 지우기", use_container_width=True, key="coach_clear_vision_ref"):
                         st.session_state[_CLEAR_COACH_VISION_REQUEST] = True
                         st.rerun()
 
@@ -885,24 +1376,41 @@ with tab_reference:
                         with st.spinner("이미지에서 대화를 읽는 중…"):
                             try:
                                 mime = up_v.type or "image/jpeg"
-                                st.session_state[COACH_VISION_TRANSCRIPT_KEY] = (
-                                    run_vision_transcribe_screenshot(up_v.getvalue(), mime)
+                                txt = run_vision_transcribe_screenshot(up_v.getvalue(), mime)
+                                st.session_state[COACH_VISION_TRANSCRIPT_DRAFT_KEY] = txt
+                                st.session_state[COACH_VISION_TRANSCRIPT_KEY] = txt
+                                st.session_state.pop(COACH_OUT_REFERENCE_VISION, None)
+                                st.session_state.pop(DANGER_REPORT_REFERENCE_VISION, None)
+                                st.success(
+                                    "추출했습니다. 수정한 뒤 **적용**을 누르면 도우미 맥락에 반영됩니다."
                                 )
-                                st.success("추출했습니다. 아래에서 수정한 뒤 오른쪽 도우미를 실행하세요.")
                             except Exception as e:
                                 st.error(f"추출 실패: {e}")
 
                 st.text_area(
                     "추출·편집",
-                    key=COACH_VISION_TRANSCRIPT_KEY,
+                    key=COACH_VISION_TRANSCRIPT_DRAFT_KEY,
                     height=140,
-                    help="스크린샷 추출 결과를 고치거나 직접 입력할 수 있습니다.",
+                    help="스크린샷 추출 결과를 고치거나 직접 입력한 뒤, 아래 **적용**으로 도우미에 넘깁니다.",
                 )
+                if st.button(
+                    "적용",
+                    type="primary",
+                    use_container_width=True,
+                    key="coach_apply_vision_ref",
+                ):
+                    st.session_state[COACH_VISION_TRANSCRIPT_KEY] = (
+                        st.session_state.get(COACH_VISION_TRANSCRIPT_DRAFT_KEY) or ""
+                    )
+                    st.session_state.pop(COACH_OUT_REFERENCE_VISION, None)
+                    st.session_state.pop(DANGER_REPORT_REFERENCE_VISION, None)
+                    st.toast("도우미 맥락에 반영되었습니다.", icon="✅")
+                    st.rerun()
 
         conv_vis = build_reference_vision_conv()
         with cv2:
             st.subheader("도우미 (스크린샷)")
-            st.caption("맥락: **이 탭의 추출·편집만**")
+            st.caption("맥락: **적용**한 추출·편집 · 위 **배경·상황**이 있으면 함께 반영됩니다.")
             mode_rv = st.radio(
                 "모드",
                 [m[0] for m in MODE_DEFS],
@@ -913,9 +1421,9 @@ with tab_reference:
             st.caption(next(d[2] for d in MODE_DEFS if d[0] == mode_rv))
 
             if mode_rv == "ment":
-                if st.button("짧은 멘트 추천", type="primary", use_container_width=True, key="ment_ref_vision"):
+                if st.button("한마디 추천", type="primary", use_container_width=True, key="ment_ref_vision"):
                     if not conv_vis:
-                        st.warning("왼쪽에서 **추출**하거나 **추출·편집**에 텍스트를 넣어 주세요.")
+                        st.warning("왼쪽에서 **추출**하거나 입력한 뒤 **적용**을 눌러 주세요.")
                     else:
                         with st.spinner("멘트 생성…"):
                             try:
@@ -924,32 +1432,40 @@ with tab_reference:
                                     partner_name,
                                     conv=conv_vis,
                                     source_blurb=MENT_SOURCE_REFERENCE_VISION,
+                                    scenario_section=sc_sec_ref,
+                                    domain_section=dom_sec_ref,
                                 )
-                                st.session_state[COACH_OUT_REFERENCE_VISION] = (
-                                    f"**{out['sentiment']}**\n\n{out['suggestion_text']}"
-                                )
+                                st.session_state[COACH_OUT_REFERENCE_VISION] = {
+                                    "_ment": True,
+                                    "sentiment": out["sentiment"],
+                                    "text": out["suggestion_text"],
+                                }
                             except Exception as e:
                                 st.session_state[COACH_OUT_REFERENCE_VISION] = f"오류: {e}"
-                if COACH_OUT_REFERENCE_VISION in st.session_state:
-                    st.markdown(st.session_state[COACH_OUT_REFERENCE_VISION])
+                render_coach_ment_output(COACH_OUT_REFERENCE_VISION)
 
             elif mode_rv == "rag":
                 if not conv_rag_available():
                     st.error("`data/conv_samples.jsonl` 이 없습니다.")
                 else:
-                    st.caption("유사 예시 검색 후 조언합니다.")
+                    st.caption("비슷한 샘플을 찾은 뒤 코칭합니다.")
                 if conv_rag_available() and st.button(
-                    "유사 대화 예시 찾기 → 조언 받기",
+                    "예시 찾고 코칭 받기",
                     type="primary",
                     use_container_width=True,
                     key="rag_ref_vision",
                 ):
                     if not conv_vis:
-                        st.warning("왼쪽에서 **추출**하거나 **추출·편집**에 텍스트를 넣어 주세요.")
+                        st.warning("왼쪽에서 **추출**하거나 입력한 뒤 **적용**을 눌러 주세요.")
                     else:
                         try:
                             partner_ctx, conv_rb, ctx_block = prepare_rag_suggestion(
-                                user_label, partner_name, conv_vis
+                                user_label,
+                                partner_name,
+                                conv_vis,
+                                scenario_hint=sc_plain_ref,
+                                domain_id=dom_id_ref,
+                                domain_other_hint=_hint_r if dom_id_ref == OTHER_DOMAIN_ID else "",
                             )
                             with st.expander("유사 대화 예시 · 검색 결과", expanded=True):
                                 render_rag_examples_panel(ctx_block)
@@ -957,24 +1473,36 @@ with tab_reference:
                                 st.markdown("**코칭 조언**")
                                 with st.spinner("조언 생성…"):
                                     st.write_stream(
-                                        stream_rag_suggestion_prepared(partner_ctx, conv_rb, ctx_block)
+                                        stream_rag_suggestion_prepared(
+                                            partner_ctx,
+                                            conv_rb,
+                                            ctx_block,
+                                            scenario_section=sc_sec_ref,
+                                            domain_section=dom_sec_ref,
+                                        )
                                     )
                         except Exception as e:
                             st.error(str(e))
 
             elif mode_rv == "vote":
                 if st.button(
-                    "여러 조언 생성 후 투표",
+                    "조언 후보 만들고 투표",
                     type="primary",
                     use_container_width=True,
                     key="vote_ref_vision",
                 ):
                     if not conv_vis:
-                        st.warning("왼쪽에서 **추출**하거나 **추출·편집**에 텍스트를 넣어 주세요.")
+                        st.warning("왼쪽에서 **추출**하거나 입력한 뒤 **적용**을 눌러 주세요.")
                     else:
                         with st.spinner("시간이 조금 걸릴 수 있어요…"):
                             try:
-                                for chunk in stream_vote_suggestion(conv_vis, user_label, partner_name):
+                                for chunk in stream_vote_suggestion(
+                                    conv_vis,
+                                    user_label,
+                                    partner_name,
+                                    scenario_section=sc_sec_ref,
+                                    domain_section=dom_sec_ref,
+                                ):
                                     write_vote_suggestion_chunk(chunk)
                             except Exception as e:
                                 st.error(str(e))
@@ -986,7 +1514,9 @@ with tab_reference:
                     conv=conv_vis,
                     report_state_key=DANGER_REPORT_REFERENCE_VISION,
                     analyze_button_key="danger_analyze_ref_vision",
-                    empty_hint="분석할 **추출·편집** 텍스트가 없습니다.",
+                    empty_hint="분석할 텍스트가 없습니다. 왼쪽에서 **적용**을 눌러 주세요.",
+                    scenario_hint=sc_plain_ref,
+                    domain_section=dom_sec_ref,
                 )
 
 st.divider()
