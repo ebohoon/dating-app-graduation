@@ -11,6 +11,26 @@ import streamlit as st
 MATCHED_PROFILE_KEY = "matched_profile"
 """사용자가 매칭으로 고른 상대 프로필."""
 
+SELECTED_OPENING_MESSAGE_KEY = "selected_opening_message"
+"""③에서 고른 첫 인사말 문장 — ④ 연습 채팅 시드에 사용."""
+
+SELECTED_OPENING_MATCH_SIG_KEY = "selected_opening_match_sig"
+"""선택한 인사말이 어떤 상대 프로필 기준인지(matched_profile_sig_str)."""
+
+
+def matched_profile_sig_str(m: dict[str, Any]) -> str:
+    """상대 프로필 동일 여부 판별용(JSON 문자열)."""
+    kw = m.get("keywords")
+    kw_l = [str(x) for x in kw] if isinstance(kw, list) else []
+    payload = {
+        "name": str(m.get("name", "")),
+        "age": int(m.get("age") or 0),
+        "job": str(m.get("job", "")),
+        "bio": str(m.get("bio", "")),
+        "keywords": sorted(kw_l),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
 # ② 매칭 페이지 세션 (임시저장·복원용 — _persistence.py 와 동일 키)
 MATCH_RESULTS_DF_KEY = "match_results_df"
 MATCH_FILTER_META_KEY = "match_filter_meta"
@@ -40,6 +60,17 @@ USER_MATCH_KEYWORDS_KEY = "user_match_keywords"
 
 USER_NAME = "철수"
 
+
+def _sig_age(val: Any) -> Any:
+    """JSON 복원 시 나이가 float(28.0)이 되어 시그니처가 어긋나는 것을 막는다."""
+    if val is None or val == "":
+        return val
+    try:
+        return int(float(val))
+    except (TypeError, ValueError):
+        return val
+
+
 STEP1_FORM_PROFILE_SIG_KEY = "_step1_form_profile_sig"
 """① 편집 폼이 USER_AI_PROFILE_KEY 와 맞춰졌는지 추적(단계 이동 후 복원용)."""
 
@@ -49,7 +80,7 @@ def _profile_signature(match: dict[str, Any] | None) -> tuple[Any, ...]:
         return ("none",)
     return (
         match.get("name"),
-        match.get("age"),
+        _sig_age(match.get("age")),
         match.get("job"),
         match.get("bio"),
         tuple(match.get("keywords") or []) if isinstance(match.get("keywords"), list) else match.get("keywords"),
@@ -66,7 +97,7 @@ def _user_profile_signature(me: dict[str, Any] | None) -> tuple[Any, ...]:
         tkw = kw
     return (
         me.get("display_name"),
-        me.get("age"),
+        _sig_age(me.get("age")),
         me.get("gender"),
         me.get("job"),
         me.get("bio"),
@@ -75,6 +106,14 @@ def _user_profile_signature(me: dict[str, Any] | None) -> tuple[Any, ...]:
         me.get("lifestyle_summary"),
         tkw,
     )
+
+
+def _chat_session_sig_token(sig: Any) -> str:
+    """
+    세션 시그니처를 JSON 문자열로 고정해 비교한다.
+    디스크 복원 시 tuple이 list로 바뀌어 `stored != sig` 가 항상 참이 되던 문제를 막는다.
+    """
+    return json.dumps(sig, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
 def _step1_profile_sync_token(me: dict[str, Any]) -> str:
@@ -234,7 +273,13 @@ def ensure_chat_session(st: Any, messages_key: str) -> tuple[str, str, str]:
 
     sig = (_profile_signature(match), _user_profile_signature(user_me))
     init_key = f"{messages_key}_init_sig"
-    if messages_key not in st.session_state or st.session_state.get(init_key) != sig:
+    stored = st.session_state.get(init_key)
+    token_new = _chat_session_sig_token(sig)
+    token_old = _chat_session_sig_token(stored) if stored is not None else None
+    msgs = st.session_state.get(messages_key)
+    msgs_ok = isinstance(msgs, list) and len(msgs) > 0 and msgs[0].get("role") == "system"
+
+    if messages_key not in st.session_state or token_old != token_new or not msgs_ok:
         st.session_state[messages_key] = [{"role": "system", "content": build_system_prompt(match, user_me)}]
         st.session_state[init_key] = sig
     ul = user_play_name(st)
@@ -271,9 +316,14 @@ def match_step_done() -> bool:
 
 
 def greeting_step_done() -> bool:
-    """③ 완료: 인사말 후보를 한 번 이상 생성한 상태."""
-    lines = st.session_state.get("_last_intro_lines")
-    return isinstance(lines, list) and len(lines) > 0
+    """③ 완료: 인사말 후보 중 하나를 선택해 ④로 넘길 수 있는 상태."""
+    txt = (st.session_state.get(SELECTED_OPENING_MESSAGE_KEY) or "").strip()
+    if not txt:
+        return False
+    m = st.session_state.get(MATCHED_PROFILE_KEY)
+    if not isinstance(m, dict):
+        return False
+    return st.session_state.get(SELECTED_OPENING_MATCH_SIG_KEY) == matched_profile_sig_str(m)
 
 
 def journey_can_access(target: str) -> tuple[bool, str]:
@@ -303,7 +353,7 @@ def journey_can_access(target: str) -> tuple[bool, str]:
     if not greeting_step_done():
         return (
             False,
-            "③ **인사말**에서 **첫 인사 후보 생성** 버튼으로 멘트를 한 번 만들어 주세요.",
+            "③ **인사말**에서 후보를 만든 뒤 **하나를 선택**해 주세요. 그다음 ④ 대화 연습으로 이동할 수 있습니다.",
         )
 
     if target == "coach":

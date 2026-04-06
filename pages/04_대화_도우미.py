@@ -20,10 +20,13 @@ from pydantic import BaseModel, Field
 
 from _match_context import (
     MATCHED_PROFILE_KEY,
+    SELECTED_OPENING_MATCH_SIG_KEY,
+    SELECTED_OPENING_MESSAGE_KEY,
     USER_AI_PROFILE_KEY,
     build_system_prompt,
     ensure_chat_session,
     journey_can_access,
+    matched_profile_sig_str,
     partner_context_for_llm,
 )
 from _rag_conv import conv_rag_available, retrieve_similar_conversations
@@ -389,6 +392,56 @@ def reset_practice_chat_messages() -> None:
     st.session_state.pop(DANGER_REPORT_PRACTICE, None)
     st.session_state.pop(COACH_OUT_PRACTICE, None)
     st.session_state.pop("_danger_alerted", None)
+    st.session_state.pop("_practice_opening_seeded_sig", None)
+
+
+def maybe_seed_practice_opening_from_step3(messages: list) -> None:
+    """
+    ③에서 고른 첫 인사말로 사용자 첫 턴을 넣고, 상대(assistant) 첫 답장을 한 번 생성한다.
+    시스템 메시지만 있을 때 한 번만 수행한다.
+    """
+    if len(messages) != 1:
+        return
+    opening = (st.session_state.get(SELECTED_OPENING_MESSAGE_KEY) or "").strip()
+    if not opening:
+        return
+    match = st.session_state.get(MATCHED_PROFILE_KEY)
+    if not isinstance(match, dict):
+        return
+    msig = matched_profile_sig_str(match)
+    if st.session_state.get(SELECTED_OPENING_MATCH_SIG_KEY) != msig:
+        return
+    seed_key = f"{msig}\n{opening}"
+    if st.session_state.get("_practice_opening_seeded_sig") == seed_key:
+        return
+
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    client = OpenAI(api_key=api_key) if api_key else OpenAI()
+    base_sys = messages[0]["content"]
+    sc_chat = coach_scenario_plain(COACH_SCENARIO_PRACTICE_KEY)
+    sys_content = (
+        f"{base_sys}\n\n[이번 연습의 배경·상황]\n{sc_chat}" if sc_chat else base_sys
+    )
+    api_msgs = [
+        {"role": "system", "content": sys_content},
+        {"role": "user", "content": opening},
+    ]
+    try:
+        with st.spinner("③에서 고른 인사말로 첫 대화를 준비하는 중…"):
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=api_msgs,
+                temperature=0.9,
+            )
+            reply = (resp.choices[0].message.content or "").strip() or "…"
+    except Exception as e:
+        st.error(f"첫 답장 생성 실패: {e}")
+        return
+
+    messages.append({"role": "user", "content": opening})
+    messages.append({"role": "assistant", "content": reply})
+    st.session_state["_practice_opening_seeded_sig"] = seed_key
+    st.rerun()
 
 
 def build_reference_paste_conv() -> str:
@@ -921,6 +974,7 @@ except ImportError:
 
 user_label, partner_name, ai_avatar = ensure_chat_session(st, MESSAGES_KEY)
 messages = st.session_state[MESSAGES_KEY]
+maybe_seed_practice_opening_from_step3(messages)
 
 # 위젯(key) 생성 전에만 외부 맥락 키를 지울 수 있음 (내용 지우기 버튼은 플래그 + rerun 후 여기서 처리)
 if st.session_state.pop(_CLEAR_COACH_PASTE_REQUEST, False):

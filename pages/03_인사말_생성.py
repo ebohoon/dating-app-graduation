@@ -1,6 +1,5 @@
 """
-Step ③ 인사말 생성
-[D] 인사말 품질 자동 평가 기능 추가
+Step ③ 인사말 생성 — 후보 생성 후 하나 선택 → ④ 연습 채팅 첫 턴으로 이어짐.
 """
 import streamlit as st
 from langchain_core.output_parsers import JsonOutputParser
@@ -8,7 +7,14 @@ from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplat
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-from _match_context import MATCHED_PROFILE_KEY, USER_AI_PROFILE_KEY, journey_can_access
+from _match_context import (
+    MATCHED_PROFILE_KEY,
+    SELECTED_OPENING_MATCH_SIG_KEY,
+    SELECTED_OPENING_MESSAGE_KEY,
+    USER_AI_PROFILE_KEY,
+    journey_can_access,
+    matched_profile_sig_str,
+)
 from _ui import (
     JOURNEY_GREETING,
     openai_key_configured,
@@ -22,40 +28,26 @@ class IntroList(BaseModel):
     intro_list: list[str] = Field(description="소개팅 첫 메시지 후보 리스트")
 
 
-# ── [D] 인사말 품질 평가 모델 ─────────────────────────────
-class GreetingEval(BaseModel):
-    naturalness: int = Field(description="자연스러움 0~100. 딱딱하지 않고 실제 대화처럼 느껴지는 정도")
-    personalization: int = Field(description="개인화 0~100. 상대 프로필을 얼마나 구체적으로 반영했는가")
-    interest_trigger: int = Field(description="흥미 유발 0~100. 상대가 답하고 싶어지는 정도")
-    overall: int = Field(description="종합 점수 0~100")
-    feedback: str = Field(description="한 줄 피드백. 구체적 개선 포인트 포함")
+INTRO_LINES_MATCH_SIG_KEY = "_intro_lines_match_sig"
 
 
-@st.cache_data(show_spinner=False)
-def evaluate_greeting(
-    greeting: str,
-    partner_name: str,
-    partner_keywords: str,
-    partner_bio: str,
-) -> dict:
-    """인사말 품질을 LLM이 채점 (캐시 적용)."""
-    model = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-    parser = JsonOutputParser(pydantic_object=GreetingEval)
-    fmt = parser.get_format_instructions()
-    prompt = ChatPromptTemplate.from_template(
-        "소개팅 앱의 첫 메시지를 평가하라.\n\n"
-        "상대: {partner_name} (키워드: {keywords}, 소개: {bio})\n"
-        "평가할 메시지: {greeting}\n\n"
-        "엄격하고 구체적으로 평가하라.\n"
-        "{format_instructions}"
-    )
-    chain = prompt.partial(format_instructions=fmt) | model | parser
-    return chain.invoke({
-        "partner_name": partner_name,
-        "keywords": partner_keywords,
-        "bio": partner_bio,
-        "greeting": greeting,
-    })
+def sync_intro_state_with_match(match: dict | None) -> None:
+    """상대가 바뀌었으면 이전 인사말 후보·선택을 제거한다."""
+    if not isinstance(match, dict) or not str(match.get("name") or "").strip():
+        st.session_state.pop("_last_intro_lines", None)
+        st.session_state.pop(INTRO_LINES_MATCH_SIG_KEY, None)
+        st.session_state.pop(SELECTED_OPENING_MESSAGE_KEY, None)
+        st.session_state.pop(SELECTED_OPENING_MATCH_SIG_KEY, None)
+        st.session_state.pop("selected_intro_idx_radio", None)
+        return
+    sig = matched_profile_sig_str(match)
+    prev = st.session_state.get(INTRO_LINES_MATCH_SIG_KEY)
+    if prev != sig:
+        st.session_state.pop("_last_intro_lines", None)
+        st.session_state.pop(SELECTED_OPENING_MESSAGE_KEY, None)
+        st.session_state.pop(SELECTED_OPENING_MATCH_SIG_KEY, None)
+        st.session_state.pop("selected_intro_idx_radio", None)
+    st.session_state[INTRO_LINES_MATCH_SIG_KEY] = sig
 
 
 def _my_profile_narrative(me: dict) -> str:
@@ -135,7 +127,7 @@ render_page_header(
     kicker="Step ③ · 인사말",
     title="첫 인사·첫 멘트",
     subtitle="**나의 정보**는 **① AI 프로필**에 저장된 내용을 씁니다. "
-    "②에서 고른 **상대 프로필**을 바탕으로 첫 메시지 초안만 만듭니다.",
+    "②에서 고른 **상대 프로필**을 바탕으로 첫 메시지 초안을 만든 뒤, **하나를 고르면** ④ 연습 채팅의 첫 대화로 이어집니다.",
 )
 
 if not openai_key_configured():
@@ -143,6 +135,7 @@ if not openai_key_configured():
 
 match = st.session_state.get(MATCHED_PROFILE_KEY)
 me = st.session_state.get(USER_AI_PROFILE_KEY)
+sync_intro_state_with_match(match if isinstance(match, dict) else None)
 
 if match:
     st.subheader("연결된 상대 프로필")
@@ -170,8 +163,10 @@ if match:
                 try:
                     lines = generate_opening_to_partner(me, match)
                     st.session_state["_last_intro_lines"] = lines
-                    # 이전 평가 초기화
-                    st.session_state.pop("_greeting_scores", None)
+                    st.session_state[INTRO_LINES_MATCH_SIG_KEY] = matched_profile_sig_str(match)
+                    st.session_state.pop(SELECTED_OPENING_MESSAGE_KEY, None)
+                    st.session_state.pop(SELECTED_OPENING_MATCH_SIG_KEY, None)
+                    st.session_state["selected_intro_idx_radio"] = 0
                 except Exception as e:
                     st.error(f"생성 오류: {e}")
 
@@ -180,84 +175,39 @@ if match:
             st.subheader("생성된 첫 인사말 후보")
 
             tone_labels = ["🤍 차분한 톤", "😄 가벼운 톤", "❓ 질문 중심"]
-            for i, line in enumerate(lines, 0):
-                with st.container(border=True):
-                    tone = tone_labels[i] if i < len(tone_labels) else f"후보 {i+1}"
-                    st.markdown(f"**후보 {i+1}** &nbsp; {tone}")
+            n = len(lines)
+            cur_idx = st.session_state.get("selected_intro_idx_radio", 0)
+            if not isinstance(cur_idx, int) or cur_idx < 0 or cur_idx >= n:
+                st.session_state["selected_intro_idx_radio"] = 0
+                cur_idx = 0
+
+            def _label_for(i: int) -> str:
+                tone = tone_labels[i] if i < len(tone_labels) else f"후보 {i + 1}"
+                return f"후보 {i + 1} · {tone}"
+
+            st.markdown("**④ 연습에서 첫 메시지로 쓸 인사말을 하나 고르세요.**")
+            idx = st.radio(
+                "선택",
+                list(range(n)),
+                format_func=_label_for,
+                key="selected_intro_idx_radio",
+                label_visibility="collapsed",
+            )
+
+            for i, line in enumerate(lines):
+                with st.expander(_label_for(i), expanded=(i == idx)):
                     st.write(line)
 
-                    # [D] 품질 점수 표시 (평가 실행 후)
-                    scores = st.session_state.get("_greeting_scores")
-                    if scores and i < len(scores):
-                        s = scores[i]
-                        overall = s.get("overall", 0)
-                        if overall >= 80:
-                            badge_color = "#16a34a"
-                        elif overall >= 60:
-                            badge_color = "#d97706"
-                        else:
-                            badge_color = "#dc2626"
+            st.session_state[SELECTED_OPENING_MESSAGE_KEY] = str(lines[idx]).strip()
+            st.session_state[SELECTED_OPENING_MATCH_SIG_KEY] = matched_profile_sig_str(match)
 
-                        st.markdown(
-                            f'<span style="background:{badge_color};color:#fff;'
-                            f'border-radius:6px;padding:2px 10px;font-size:0.82rem;font-weight:700;">'
-                            f"⭐ 종합 {overall}점</span>",
-                            unsafe_allow_html=True,
-                        )
-                        sc1, sc2, sc3 = st.columns(3)
-                        with sc1:
-                            st.caption(f"자연스러움: {s.get('naturalness', 0)}점")
-                            st.progress(s.get("naturalness", 0) / 100)
-                        with sc2:
-                            st.caption(f"개인화: {s.get('personalization', 0)}점")
-                            st.progress(s.get("personalization", 0) / 100)
-                        with sc3:
-                            st.caption(f"흥미 유발: {s.get('interest_trigger', 0)}점")
-                            st.progress(s.get("interest_trigger", 0) / 100)
-                        st.info(f"💬 {s.get('feedback', '')}")
-
-            # [D] 품질 평가 버튼
-            st.divider()
-            if st.button("📊 인사말 품질 평가하기", use_container_width=True):
-                with st.spinner("AI가 3개 인사말을 동시에 채점 중…"):
-                    try:
-                        partner_kw_str = ", ".join(match.get("keywords") or [])
-                        partner_bio_str = str(match.get("bio") or "")
-                        partner_name_str = str(match.get("name") or "")
-
-                        scores = []
-                        for line in lines:
-                            s = evaluate_greeting(
-                                greeting=line,
-                                partner_name=partner_name_str,
-                                partner_keywords=partner_kw_str,
-                                partner_bio=partner_bio_str,
-                            )
-                            scores.append(s)
-                        st.session_state["_greeting_scores"] = scores
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"평가 오류: {e}")
-
-            # 평가 완료 후 최고 추천
-            scores = st.session_state.get("_greeting_scores")
-            if scores:
-                best_idx = max(range(len(scores)), key=lambda i: scores[i].get("overall", 0))
-                best_score = scores[best_idx].get("overall", 0)
-                st.success(
-                    f"🏆 **추천 인사말: 후보 {best_idx + 1}** ({tone_labels[best_idx] if best_idx < len(tone_labels) else ''}) "
-                    f"— 종합 {best_score}점"
-                )
-
-            n1, n2 = st.columns(2)
-            with n1:
-                st.page_link(
-                    "pages/04_대화_도우미.py",
-                    label="다음: 대화 연습 →",
-                    use_container_width=True,
-                )
-            with n2:
-                st.caption("대화 도우미에서 같은 상대와 채팅 연습이 이어집니다.")
+            st.success("선택한 문장이 **④ 대화 연습**에 첫 메시지로 자동 반영됩니다. 아래에서 이동하세요.")
+            st.page_link(
+                "pages/04_대화_도우미.py",
+                label="다음: 대화 연습 →",
+                use_container_width=True,
+            )
+            st.caption("④에서 상대가 보낸 첫 답장까지 자동으로 이어질 수 있습니다.")
 
 else:
     st.info(
