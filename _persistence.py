@@ -1,6 +1,14 @@
 """
-Streamlit 세션은 새로고침(F5) 시 초기화될 수 있어,
-주요 사용자 데이터를 data/app_session_state.json 에 저장·복원합니다.
+세션·저장 동작 요약
+------------------
+- **브라우저 탭이 열려 있는 동안**: Streamlit이 `st.session_state`에 상태를 유지합니다.
+  (일반 웹의 "쿠키"가 아니라, 서버·세션 연결 단위 저장입니다.)
+- **새로고침(F5) / 브라우저 재실행 후**: 세션이 비워질 수 있어, 같은 PC에서는
+  `data/app_session_state.json`에 주기적으로 백업합니다.
+- **자동 저장 시점**: 각 페이지 맨 아래 `render_trust_footer()`가 스크립트 한 번
+  실행이 끝날 때 `save_session_to_disk()`를 호출합니다.
+- **자동 복원 시점**: `render_page_shell()` 시작 시 `restore_session_from_disk()`
+  한 번(중복 복원 방지 플래그 사용).
 """
 from __future__ import annotations
 
@@ -50,10 +58,23 @@ PERSIST_KEYS: tuple[str, ...] = (
     MATCHED_PROFILE_KEY,
     "interest_draft",
     MATCH_RESULTS_DF_KEY,
+    "_kw_only_results",
     MATCH_FILTER_META_KEY,
+    "liked_profiles",
+    "disliked_profiles",
     MESSAGES_COACH_KEY,
     f"{MESSAGES_COACH_KEY}{INIT_SIG_SUFFIX}",
     "_last_intro_lines",
+    "_greeting_scores",
+    "_profile_score",
+    "_coach_side_out_practice",
+    "_coach_side_out_reference_paste",
+    "_coach_side_out_reference_vision",
+    "_danger_report_practice",
+    "_danger_report_reference_paste",
+    "_danger_report_reference_vision",
+    "coach_external_paste",
+    "coach_vision_transcript",
 )
 
 
@@ -62,6 +83,8 @@ def _hydrated_key() -> str:
 
 
 def _to_storable(val: Any) -> Any:
+    if isinstance(val, set):
+        return {"__kind__": "set", "items": list(val)}
     try:
         import pandas as pd
 
@@ -80,6 +103,8 @@ def _from_stored(val: Any) -> Any:
         import pandas as pd
 
         return pd.read_json(StringIO(val["json"]), orient="records")
+    if isinstance(val, dict) and val.get("__kind__") == "set":
+        return set(val.get("items") or [])
     return val
 
 
@@ -110,6 +135,8 @@ def restore_session_from_disk() -> None:
             out = _from_stored(v)
             if k == MATCH_FILTER_META_KEY:
                 out = _fix_match_meta(out)
+            if k in ("liked_profiles", "disliked_profiles") and isinstance(out, list):
+                out = set(out)
             st.session_state[k] = out
     except (OSError, json.JSONDecodeError, ValueError, TypeError):
         pass
@@ -148,42 +175,3 @@ def clear_saved_session() -> None:
     for k in PERSIST_KEYS:
         st.session_state.pop(k, None)
     st.session_state.pop(_hydrated_key(), None)
-
-
-def _feedback_after_temp_save() -> None:
-    if save_session_to_disk():
-        st.success("저장했어요. 새로고침 후에도 이 기기에서 이어집니다.")
-    else:
-        st.error("`data/` 폴더에 쓸 수 없습니다. 권한을 확인해 주세요.")
-
-
-def render_persistence_topbar() -> None:
-    """본문 상단: 임시저장 (카드형)."""
-    with st.container(border=True):
-        c1, c2 = st.columns([1, 4])
-        with c1:
-            if st.button(
-                "임시저장",
-                key="_persist_btn_topbar",
-                type="primary",
-                help="입력·검색 결과·대화 등을 로컬 파일에 저장합니다. 페이지 끝까지 내려가도 자동 저장됩니다.",
-            ):
-                _feedback_after_temp_save()
-        with c2:
-            st.caption(
-                "이 PC의 data/app_session_state.json 에 저장됩니다. "
-                "탭을 닫기 전에 한 번 저장해 두면 안전합니다."
-            )
-
-
-def render_persistence_sidebar() -> None:
-    with st.sidebar:
-        st.divider()
-        st.caption("로컬 저장을 비우면 복원용 데이터가 사라집니다.")
-        if st.button(
-            "저장 초기화",
-            key="_btn_clear_session_file",
-            help="저장 파일 삭제 + 이 탭의 복원용 입력 제거",
-        ):
-            clear_saved_session()
-            st.rerun()

@@ -27,7 +27,7 @@ from _rag_profile import (
 )
 from _ui import render_match_page_styles, render_page_header, render_trust_footer
 
-st.set_page_config(layout="wide", page_icon="💕")
+st.set_page_config(page_title="통합 데이팅 AI", layout="wide", page_icon="💕")
 render_match_page_styles()
 
 render_page_header(
@@ -65,21 +65,11 @@ def load_profiles() -> pd.DataFrame:
 
 profiles = load_profiles()
 
-m1, m2, m3 = st.columns(3)
-with m1:
-    st.metric("DB 프로필 수", f"{len(profiles)}명")
-with m2:
-    _df = st.session_state.get(MATCH_RESULTS_DF_KEY)
-    if isinstance(_df, pd.DataFrame):
-        st.metric("직전 검색 결과", f"{len(_df)}명")
-    else:
-        st.metric("직전 검색 결과", "—")
-with m3:
-    if st.button("검색 결과 지우기", help="목록만 초기화합니다"):
-        for k in (MATCH_RESULTS_DF_KEY, MATCH_FILTER_META_KEY,
-                  "_kw_only_results", "liked_profiles", "disliked_profiles"):
-            st.session_state.pop(k, None)
-        st.rerun()
+if st.button("검색 결과 지우기", help="목록만 초기화합니다"):
+    for k in (MATCH_RESULTS_DF_KEY, MATCH_FILTER_META_KEY,
+              "_kw_only_results", "liked_profiles", "disliked_profiles"):
+        st.session_state.pop(k, None)
+    st.rerun()
 
 if profile_embedding_available():
     st.info(

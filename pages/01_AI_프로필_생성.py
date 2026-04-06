@@ -182,8 +182,8 @@ def generate_profile_ai(st0) -> dict:
 # UI
 # ════════════════════════════════════════════════════
 
-st.set_page_config(layout="wide", page_icon="💗")
-render_page_shell("AI 프로필", journey_step=JOURNEY_PROFILE)
+st.set_page_config(page_title="통합 데이팅 AI", layout="wide", page_icon="💗")
+render_page_shell(journey_step=JOURNEY_PROFILE)
 _ensure_pf_defaults()
 
 render_page_header(
@@ -195,12 +195,10 @@ render_page_header(
 
 if not openai_key_configured():
     st.warning("OpenAI API 키가 없으면 생성할 수 없습니다. 홈의 **API 키 설정**을 확인해 주세요.")
-else:
-    st.caption("모델: gpt-4o-mini · 입력은 프롬프트에만 사용됩니다.")
 
 st.markdown('<p class="ux-section-title">입력</p>', unsafe_allow_html=True)
 st.markdown(
-    '<p class="ux-section-lead">홈에서 적은 키워드가 이미 있다면 그대로 이어집니다. 쉼표로 여러 개 넣을 수 있어요.</p>',
+    '<p class="ux-section-lead">이전에 입력해 둔 키워드가 있으면 그대로 이어집니다. 쉼표로 여러 개 넣을 수 있어요.</p>',
     unsafe_allow_html=True,
 )
 st.text_area(

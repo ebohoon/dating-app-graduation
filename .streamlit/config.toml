@@ -5,5 +5,10 @@ secondaryBackgroundColor = "#ffe4ec"
 textColor = "#500724"
 font = "sans serif"
 
+[client]
+# Streamlit 기본 사이드바 페이지 목록 숨김 → 파일명 'app'이 왼쪽 메뉴에 노출되지 않음.
+# 이동은 상단 빠른 링크 + 왼쪽 '진행 단계'만 사용 (Streamlit 1.29+).
+showSidebarNavigation = false
+
 [server]
 headless = true

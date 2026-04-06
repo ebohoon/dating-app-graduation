@@ -117,8 +117,8 @@ def generate_opening_to_partner(my_profile: dict, partner: dict) -> list[str]:
 # UI
 # ════════════════════════════════════════════════════
 
-st.set_page_config(layout="wide", page_icon="💌")
-render_page_shell("인사말 생성", journey_step=JOURNEY_GREETING)
+st.set_page_config(page_title="통합 데이팅 AI", layout="wide", page_icon="💌")
+render_page_shell(journey_step=JOURNEY_GREETING)
 
 render_page_header(
     kicker="Step ③ · 인사말",
@@ -129,8 +129,6 @@ render_page_header(
 
 if not openai_key_configured():
     st.warning("OpenAI API 키가 없으면 생성할 수 없습니다. 홈에서 키를 설정해 주세요.")
-else:
-    st.caption("모델: gpt-4o-mini · 후보 3개는 톤을 달리했습니다.")
 
 match = st.session_state.get(MATCHED_PROFILE_KEY)
 me = st.session_state.get(USER_AI_PROFILE_KEY)
