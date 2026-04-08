@@ -56,6 +56,11 @@ OTHER_DOMAIN_ID = "other"
 
 VOTE_UI_HTML = "vote_ui_html"
 
+RAG_MODE_CAPTION = (
+    "비슷한 **대화 샘플**을 찾은 뒤 코칭합니다. 시나리오에 샘플 **카테고리**(예: 답장 지연, 반응 애매함)를 쓰면 그 유형 위주로만 골라요. "
+    "**첫 실행**에 임베딩 API가 잠깐 호출될 수 있어요."
+)
+
 # (id, UI 라벨, LLM용 코칭 규칙) — 멘트·투표·RAG·위험 분석에 공통 주입
 CONVERSATION_DOMAINS: tuple[tuple[str, str, str], ...] = (
     (
@@ -450,7 +455,10 @@ def build_reference_paste_conv() -> str:
 
 
 def build_reference_vision_conv() -> str:
-    """참고 맥락 · 스크린샷 추출문 전용."""
+    """참고 맥락 · 스크린샷: 편집창(드래프트)에 글자가 있으면 그 내용을, 없으면 적용된 스크립트를 쓴다."""
+    draft = (st.session_state.get(COACH_VISION_TRANSCRIPT_DRAFT_KEY) or "").strip()
+    if draft:
+        return draft
     return (st.session_state.get(COACH_VISION_TRANSCRIPT_KEY) or "").strip()
 
 
@@ -554,6 +562,7 @@ def stream_vote_suggestion(
     *,
     scenario_section: str = "",
     domain_section: str = "",
+    source_blurb: str = "",
 ):
     match = st.session_state.get(MATCHED_PROFILE_KEY)
     partner_ctx = partner_context_for_llm(match, user_label)
@@ -567,7 +576,9 @@ def stream_vote_suggestion(
         "{partner_ctx}\n\n"
         "{scenario_section}"
         "{domain_section}"
-        "{conv}\n"
+        "아래는 {source_blurb}\n\n"
+        "{conv}\n\n"
+        "**반드시:** 조언은 **위에 인용한 대화 텍스트만** 근거로 한다. 앱의 **연습 채팅**이나 **다른 참고 맥락 탭**의 대화를 상상·인용하지 마라.\n"
         "위 대화를 **선택한 대화 유형**에 맞게 분석하고 {name}에게 markdown으로 적절한 조언을 하라. "
         "1:1 소개팅만 전제로 하지 마라.\n"
         "{format_instructions}"
@@ -584,7 +595,9 @@ def stream_vote_suggestion(
         "{partner_ctx}\n\n"
         "{scenario_section}"
         "{domain_section}"
-        "{conv}\n"
+        "아래는 {source_blurb}\n\n"
+        "{conv}\n\n"
+        "후보 선택 시에도 **위 인용 대화만** 기준으로 삼는다. 연습 채팅 등 다른 출처를 끌어오지 마라.\n"
         "아래는 {name}에게 하면 좋을 조언 후보들이다. **대화 유형**에 가장 잘 맞는 하나를 고르고 번호를 응답하라.\n"
         "{candidates}\n"
         "{format_instructions}"
@@ -597,8 +610,9 @@ def stream_vote_suggestion(
         "partner_ctx": partner_ctx,
         "scenario_section": scenario_section or "",
         "domain_section": domain_section or "",
+        "source_blurb": source_blurb or "제시된 대화 로그이다.",
     }
-    suggestion_list = gen_chain.batch([batch_common] * num_candi)
+    suggestion_list = gen_chain.batch([dict(batch_common) for _ in range(num_candi)])
     yield (VOTE_UI_HTML, format_vote_candidates_html(suggestion_list))
     cand_text = "\n\n".join(
         [
@@ -606,19 +620,16 @@ def stream_vote_suggestion(
             for i, s in enumerate(suggestion_list)
         ]
     )
-    votes = vote_chain.batch(
-        [
-            {
-                "conv": conv,
-                "name": user_label,
-                "candidates": cand_text,
-                "partner_ctx": partner_ctx,
-                "scenario_section": scenario_section or "",
-                "domain_section": domain_section or "",
-            }
-        ]
-        * num_candi
-    )
+    vote_row = {
+        "conv": conv,
+        "name": user_label,
+        "candidates": cand_text,
+        "partner_ctx": partner_ctx,
+        "scenario_section": scenario_section or "",
+        "domain_section": domain_section or "",
+        "source_blurb": batch_common["source_blurb"],
+    }
+    votes = vote_chain.batch([dict(vote_row) for _ in range(num_candi)])
     df = pd.DataFrame(votes)
     yield "### 투표 요약\n"
     yield df
@@ -1139,9 +1150,7 @@ with tab_practice:
             if not conv_rag_available():
                 st.error("`data/conv_samples.jsonl` 이 없습니다.")
             else:
-                st.caption(
-                    "비슷한 **대화 샘플**을 찾은 뒤 코칭합니다. **첫 실행**에 임베딩 API가 잠깐 호출될 수 있어요."
-                )
+                st.caption(RAG_MODE_CAPTION)
             if conv_rag_available() and st.button(
                 "예시 찾고 코칭 받기",
                 type="primary",
@@ -1195,6 +1204,7 @@ with tab_practice:
                                 partner_name,
                                 scenario_section=sc_sec_practice,
                                 domain_section=dom_sec_practice,
+                                source_blurb=MENT_SOURCE_PRACTICE,
                             ):
                                 write_vote_suggestion_chunk(chunk)
                         except Exception as e:
@@ -1325,7 +1335,7 @@ with tab_reference:
                 if not conv_rag_available():
                     st.error("`data/conv_samples.jsonl` 이 없습니다.")
                 else:
-                    st.caption("비슷한 샘플을 찾은 뒤 코칭합니다.")
+                    st.caption(RAG_MODE_CAPTION)
                 if conv_rag_available() and st.button(
                     "예시 찾고 코칭 받기",
                     type="primary",
@@ -1379,6 +1389,7 @@ with tab_reference:
                                     partner_name,
                                     scenario_section=sc_sec_ref,
                                     domain_section=dom_sec_ref,
+                                    source_blurb=MENT_SOURCE_REFERENCE_PASTE,
                                 ):
                                     write_vote_suggestion_chunk(chunk)
                             except Exception as e:
@@ -1502,7 +1513,7 @@ with tab_reference:
                 if not conv_rag_available():
                     st.error("`data/conv_samples.jsonl` 이 없습니다.")
                 else:
-                    st.caption("비슷한 샘플을 찾은 뒤 코칭합니다.")
+                    st.caption(RAG_MODE_CAPTION)
                 if conv_rag_available() and st.button(
                     "예시 찾고 코칭 받기",
                     type="primary",
@@ -1545,17 +1556,19 @@ with tab_reference:
                     use_container_width=True,
                     key="vote_ref_vision",
                 ):
-                    if not conv_vis:
+                    conv_vote = build_reference_vision_conv()
+                    if not conv_vote:
                         st.warning("왼쪽에서 **추출**하거나 입력한 뒤 **적용**을 눌러 주세요.")
                     else:
                         with st.spinner("시간이 조금 걸릴 수 있어요…"):
                             try:
                                 for chunk in stream_vote_suggestion(
-                                    conv_vis,
+                                    conv_vote,
                                     user_label,
                                     partner_name,
                                     scenario_section=sc_sec_ref,
                                     domain_section=dom_sec_ref,
+                                    source_blurb=MENT_SOURCE_REFERENCE_VISION,
                                 ):
                                     write_vote_suggestion_chunk(chunk)
                             except Exception as e:

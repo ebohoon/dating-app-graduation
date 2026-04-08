@@ -85,7 +85,12 @@ def _match_interests_from_step1() -> list[str]:
 @st.cache_data
 def load_profiles() -> pd.DataFrame:
     path = data_path("profile_db.jsonl")
-    return pd.read_json(str(path), lines=True)
+    df = pd.read_json(str(path), lines=True)
+    if "id" not in df.columns:
+        df["id"] = [f"p{i + 1:04d}" for i in range(len(df))]
+    else:
+        df["id"] = df["id"].astype(str)
+    return df
 
 
 profiles = load_profiles()
@@ -182,6 +187,8 @@ with st.form("search_form"):
 
 # ════════════════════════════════════════════════════
 # 매칭 알고리즘
+# - Hard filter: 나이·성별·직업/소개 부분문자열·(옵션) 최소 정확 키워드 개수
+# - Soft ranking: keyword_score(정확 일치 비율) + emb_score(프로필 풍부 텍스트 임베딩)
 # ════════════════════════════════════════════════════
 
 def _apply_profile_text_filters(
@@ -270,7 +277,8 @@ def filter_profiles_hybrid(
         pass
 
     if use_embedding:
-        filtered["emb_score"] = filtered["name"].map(emb_scores).fillna(0.0).clip(0.0, 1.0)
+        _pid = filtered["id"].astype(str) if "id" in filtered.columns else filtered["name"].astype(str)
+        filtered["emb_score"] = _pid.map(emb_scores).fillna(0.0).clip(0.0, 1.0)
         filtered["match_score"] = 0.5 * filtered["keyword_score"] + 0.5 * filtered["emb_score"]
         threshold = float(hybrid_threshold)
     else:
@@ -307,10 +315,11 @@ def _sort_match_results(
     return out
 
 
-def _drop_disliked_names(df: pd.DataFrame | None, disliked: set[str]) -> pd.DataFrame | None:
+def _drop_disliked_ids(df: pd.DataFrame | None, disliked: set[str]) -> pd.DataFrame | None:
     if df is None or df.empty or not disliked:
         return df
-    return df[~df["name"].astype(str).isin(disliked)].copy()
+    key = "id" if "id" in df.columns else "name"
+    return df[~df[key].astype(str).isin(disliked)].copy()
 
 
 def _limit_rows(df: pd.DataFrame | None, max_rows: int) -> pd.DataFrame | None:
@@ -472,8 +481,8 @@ if submitted:
         )
 
     if hide_passed:
-        result_hybrid = _drop_disliked_names(result_hybrid, disliked_for_filter)
-        result_kw_only = _drop_disliked_names(result_kw_only, disliked_for_filter)
+        result_hybrid = _drop_disliked_ids(result_hybrid, disliked_for_filter)
+        result_kw_only = _drop_disliked_ids(result_kw_only, disliked_for_filter)
 
     result_hybrid = _sort_match_results(result_hybrid, sort_mode, user_age_for_sort)
     result_kw_only = _sort_match_results(result_kw_only, sort_mode, user_age_for_sort)
@@ -505,7 +514,7 @@ def profile_dict_from_row(r: pd.Series) -> dict:
         kw = list(kw)
     elif not isinstance(kw, list):
         kw = []
-    return {
+    out = {
         "name": str(r["name"]),
         "age": int(r["age"]) if pd.notna(r["age"]) else 0,
         "gender": str(r["gender"]),
@@ -513,6 +522,9 @@ def profile_dict_from_row(r: pd.Series) -> dict:
         "bio": str(r["bio"]),
         "keywords": [str(x) for x in kw],
     }
+    if "id" in r.index and pd.notna(r["id"]):
+        out["id"] = str(r["id"])
+    return out
 
 
 # ════════════════════════════════════════════════════
@@ -589,6 +601,7 @@ if result_hybrid is not None:
             exact_cnt = int(row.get("match_count", 0))
             emb_score = float(row.get("emb_score", 0.0))
             name_str = str(row["name"])
+            row_id = str(row["id"]) if "id" in row.index and pd.notna(row.get("id")) else name_str
 
             # 점수 색상
             if hybrid_pct >= 75:
@@ -605,7 +618,7 @@ if result_hybrid is not None:
             )
 
             # [F] 좋아요/관심없음 아이콘 표시
-            fav_icon = " ❤️" if name_str in liked_set else (" 🚫" if name_str in disliked_set else "")
+            fav_icon = " ❤️" if row_id in liked_set else (" 🚫" if row_id in disliked_set else "")
 
             st.markdown(
                 f"##### {name_str}{fav_icon} · {row['age']}세 · {row['gender']} &nbsp; {score_badge}",
@@ -659,9 +672,9 @@ if result_hybrid is not None:
             if show_enhanced:
                 # [A] 매칭 이유 AI 설명
                 with st.expander("🤔 왜 추천됐나요? (AI 설명)"):
-                    reason_key = f"_reason_{name_str}_{hybrid_pct}"
+                    reason_key = f"_reason_{row_id}_{hybrid_pct}"
                     if reason_key not in st.session_state:
-                        if st.button("설명 생성", key=f"reason_btn_{tab_prefix}_{name_str}_{hybrid_pct}"):
+                        if st.button("설명 생성", key=f"reason_btn_{tab_prefix}_{row_id}_{hybrid_pct}"):
                             with st.spinner("AI가 이유를 분석 중…"):
                                 try:
                                     reason = generate_match_reason(
@@ -691,7 +704,7 @@ if result_hybrid is not None:
                             st.metric(dim, f"{val}점")
 
             # 버튼 행 — 순서: ③ 인사말 → ④ 대화는 ③ 이후. 열 3개·좁은 gap 으로 한 덩어리처럼 배치
-            btn_key = f"{tab_prefix}_{name_str}_{row['age']}"
+            btn_key = f"{tab_prefix}_{row_id}_{row['age']}"
             try:
                 bc1, bc2, bc3 = st.columns([2.4, 1, 1], gap="small")
             except TypeError:
@@ -706,23 +719,23 @@ if result_hybrid is not None:
                     st.session_state[MATCHED_PROFILE_KEY] = profile_dict_from_row(row)
                     st.switch_page("pages/03_인사말_생성.py")
             with bc2:
-                like_label = "❤️ 취소" if name_str in liked_set else "👍 관심"
+                like_label = "❤️ 취소" if row_id in liked_set else "👍 관심"
                 if st.button(like_label, key=f"like_{btn_key}", use_container_width=True):
-                    if name_str in liked_set:
-                        liked_set.discard(name_str)
+                    if row_id in liked_set:
+                        liked_set.discard(row_id)
                     else:
-                        liked_set.add(name_str)
-                        disliked_set.discard(name_str)
+                        liked_set.add(row_id)
+                        disliked_set.discard(row_id)
                     st.session_state["liked_profiles"] = liked_set
                     st.rerun()
             with bc3:
-                dis_label = "🚫 취소" if name_str in disliked_set else "👎 패스"
+                dis_label = "🚫 취소" if row_id in disliked_set else "👎 패스"
                 if st.button(dis_label, key=f"dis_{btn_key}", use_container_width=True):
-                    if name_str in disliked_set:
-                        disliked_set.discard(name_str)
+                    if row_id in disliked_set:
+                        disliked_set.discard(row_id)
                     else:
-                        disliked_set.add(name_str)
-                        liked_set.discard(name_str)
+                        disliked_set.add(row_id)
+                        liked_set.discard(row_id)
                     st.session_state["disliked_profiles"] = disliked_set
                     st.rerun()
 
@@ -751,12 +764,18 @@ if result_hybrid is not None:
         with tab_compare:
             st.subheader("📊 하이브리드 vs 키워드 전용 비교")
 
-            hybrid_names = set(result_hybrid["name"].tolist()) if not result_hybrid.empty else set()
-            kw_names = set(result_kw_only["name"].tolist()) if (result_kw_only is not None and not result_kw_only.empty) else set()
+            _id_h = "id" if "id" in result_hybrid.columns else "name"
+            _id_k = "id" if (result_kw_only is not None and "id" in result_kw_only.columns) else "name"
+            hybrid_ids = set(result_hybrid[_id_h].astype(str).tolist()) if not result_hybrid.empty else set()
+            kw_ids = (
+                set(result_kw_only[_id_k].astype(str).tolist())
+                if (result_kw_only is not None and not result_kw_only.empty)
+                else set()
+            )
 
-            only_hybrid = hybrid_names - kw_names
-            only_kw = kw_names - hybrid_names
-            both = hybrid_names & kw_names
+            only_hybrid = hybrid_ids - kw_ids
+            only_kw = kw_ids - hybrid_ids
+            both = hybrid_ids & kw_ids
 
             col_a, col_b, col_c = st.columns(3)
             with col_a:
@@ -771,39 +790,58 @@ if result_hybrid is not None:
             if only_hybrid:
                 st.markdown("#### 하이브리드가 새로 발굴한 상대 (의미 매칭 덕분)")
                 st.caption("키워드가 정확히 일치하지 않아도 의미 유사도로 찾아낸 사람들입니다.")
-                for name in only_hybrid:
-                    row_data = result_hybrid[result_hybrid["name"] == name].iloc[0]
+                for pid in only_hybrid:
+                    row_data = result_hybrid[result_hybrid[_id_h].astype(str) == pid].iloc[0]
                     pct = int(round(float(row_data["match_score"]) * 100))
                     emb_pct = int(float(row_data.get("emb_score", 0)) * 100)
-                    st.success(f"**{name}** — 하이브리드 {pct}% | 의미 유사도 {emb_pct}%")
+                    disp = str(row_data["name"])
+                    st.success(f"**{disp}** — 하이브리드 {pct}% | 의미 유사도 {emb_pct}%")
 
             # 전체 비교 테이블
             st.markdown("#### 전체 비교 테이블")
-            all_names = hybrid_names | kw_names
+            all_ids = hybrid_ids | kw_ids
             compare_rows = []
-            for name in all_names:
-                h_row = result_hybrid[result_hybrid["name"] == name]
-                k_row = result_kw_only[result_kw_only["name"] == name] if result_kw_only is not None else pd.DataFrame()
+            for pid in all_ids:
+                h_row = result_hybrid[result_hybrid[_id_h].astype(str) == pid]
+                k_row = (
+                    result_kw_only[result_kw_only[_id_k].astype(str) == pid]
+                    if result_kw_only is not None
+                    else pd.DataFrame()
+                )
                 h_pct = int(round(float(h_row["match_score"].iloc[0]) * 100)) if not h_row.empty else "—"
                 k_pct = int(round(float(k_row["match_score"].iloc[0]) * 100)) if not k_row.empty else "—"
+                disp_name = str(h_row["name"].iloc[0]) if not h_row.empty else (
+                    str(k_row["name"].iloc[0]) if not k_row.empty else pid
+                )
                 compare_rows.append({
-                    "이름": name,
+                    "이름": disp_name,
                     "하이브리드 점수": f"{h_pct}%" if h_pct != "—" else "미포함",
                     "키워드 전용 점수": f"{k_pct}%" if k_pct != "—" else "미포함",
-                    "비고": "🆕 의미 매칭" if name in only_hybrid else ("📌 공통" if name in both else "키워드만"),
+                    "비고": "🆕 의미 매칭" if pid in only_hybrid else ("📌 공통" if pid in both else "키워드만"),
                 })
             if compare_rows:
                 st.dataframe(pd.DataFrame(compare_rows), use_container_width=True, hide_index=True)
 
-        # [F] 관심 목록 요약
+        # [F] 관심 목록 요약 (세션은 id, 표시는 이름)
+        def _fmt_profile_ids(ids: set[str]) -> str:
+            if not ids:
+                return ""
+            if "id" not in profiles.columns:
+                return ", ".join(sorted(ids))
+            parts: list[str] = []
+            for pid in sorted(ids):
+                hit = profiles[profiles["id"].astype(str) == str(pid)]
+                parts.append(str(hit.iloc[0]["name"]) if not hit.empty else pid)
+            return ", ".join(parts)
+
         if liked_set or disliked_set:
             st.divider()
             fl1, fl2 = st.columns(2)
             with fl1:
                 if liked_set:
-                    st.markdown(f"❤️ **관심 있음** ({len(liked_set)}명): " + ", ".join(liked_set))
+                    st.markdown(f"❤️ **관심 있음** ({len(liked_set)}명): " + _fmt_profile_ids(liked_set))
             with fl2:
                 if disliked_set:
-                    st.markdown(f"🚫 **패스** ({len(disliked_set)}명): " + ", ".join(disliked_set))
+                    st.markdown(f"🚫 **패스** ({len(disliked_set)}명): " + _fmt_profile_ids(disliked_set))
 
 render_trust_footer()
